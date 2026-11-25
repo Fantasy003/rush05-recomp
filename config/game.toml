@@ -1,0 +1,21 @@
+[game]
+sha1 = "bc617530bb9b6e4179f2e54d7816c38676812dde"
+
+[system]
+boot = "direct"
+freebios = true
+generated_firmware = true
+player_name = "Player"
+
+[display]
+screen_layout = "stacked"
+fullscreen = "off"
+adaptive_widescreen = "none"
+internal_resolution = 1
+
+[cartridge]
+save_type = "eeprom"
+save_size = 8192
+
+[network]
+enabled = false

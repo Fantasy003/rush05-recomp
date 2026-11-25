@@ -1,0 +1,22 @@
+--- a/src/recomp_runtime_ui.h
++++ b/src/recomp_runtime_ui.h
+@@ -146,6 +146,7 @@
+      * coupling the shared UI to a particular operating system.
+      */
+     uint32_t presentation_flags;
++    const char *navigation_help;
+ } RecompRuntimeUiConfig;
+ 
+ enum {
+--- a/src/common/recomp_runtime_ui.c
++++ b/src/common/recomp_runtime_ui.c
+@@ -539,7 +539,8 @@
+         }
+     }
+ 
+-    const char *help = "UP/DOWN SELECT  LEFT/RIGHT CHANGE  ENTER ACCEPT";
++    const char *help = ui->config.navigation_help ? ui->config.navigation_help :
++        "UP/DOWN SELECT  LEFT/RIGHT CHANGE  ENTER ACCEPT";
+     if (ui->in_section) {
+         const RecompRuntimeUiItem *item = recomp_runtime_ui_section_item(
+             ui, ui->section_index, ui->row_index);
