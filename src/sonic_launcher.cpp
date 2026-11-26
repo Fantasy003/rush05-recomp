@@ -14,6 +14,7 @@
 #include <string_view>
 #include <vector>
 #include "sha1.h"
+#include "sonic_pc_settings.h"
 
 int nds_runner_main(int argc, char** argv);
 namespace fs = std::filesystem;
@@ -122,9 +123,32 @@ int main(int argc, char** argv) {
             CommandLineToArgvW(GetCommandLineW(), &wide_count), &LocalFree);
         if (!wide_args) throw std::runtime_error("No se pudieron leer los argumentos.");
         fs::path rom;
+        std::vector<std::string> battle_arguments;
+        const std::wstring_view option = wide_count > 1 ? wide_args.get()[1] : L"";
+        const bool battle = option == L"--battle-host" || option == L"--battle-join";
+        const auto set_battle_arguments = [&](int role, const std::string& local_ip,
+                                               const std::string& peer_ip) {
+            battle_arguments = {"--instance-index", role == 1 ? "0" : "1",
+                "--local-wireless", "on", "--local-wireless-bind", local_ip,
+                "--local-wireless-peer", peer_ip};
+        };
         const bool choose_only = wide_count == 2 &&
-            std::wstring_view(wide_args.get()[1]) == L"--choose-rom";
-        if (check_only && wide_count == 3) rom = wide_args.get()[2];
+            option == L"--choose-rom";
+        if (battle) {
+            if (wide_count != 4)
+                throw std::runtime_error("Usage: SonicRush.exe --battle-host|--battle-join YOUR_IPV4 FRIEND_IPV4");
+            std::string ip[2];
+            for (int i = 0; i < 2; ++i) {
+                for (wchar_t c : std::wstring_view(wide_args.get()[i + 2])) {
+                    if ((c < L'0' || c > L'9') && c != L'.')
+                        throw std::runtime_error("Enter both IPv4 addresses as four numbers separated by dots.");
+                    ip[i].push_back(static_cast<char>(c));
+                }
+            }
+            if (!sonic_pc_battle_ipv4(ip[0]) || !sonic_pc_battle_ipv4(ip[1]))
+                throw std::runtime_error("Enter a valid IPv4 address for each PC.");
+            set_battle_arguments(option == L"--battle-host" ? 1 : 2, ip[0], ip[1]);
+        } else if (check_only && wide_count == 3) rom = wide_args.get()[2];
         else if (!check_only && wide_count == 2 && !choose_only) rom = wide_args.get()[1];
         else if ((check_only && wide_count != 3) ||
                  (!check_only && wide_count != 1 && !choose_only)) {
@@ -170,15 +194,25 @@ int main(int argc, char** argv) {
         _wfreopen(log.c_str(), L"a", stdout);
         if (!SetCurrentDirectoryW(user_directory.c_str())) throw std::runtime_error("No se pudo abrir la carpeta de partidas.");
         if (!std::getenv("NDS_HOSTPROF")) _putenv_s("NDS_HOSTPROF", "off");
+        const std::string runtime_settings = local_path(user_directory) + "\\settings.toml";
+        if (!battle) {
+            sonic_pc_load(sonic_pc_settings_path(runtime_settings));
+            if (g_sonic_pc.battle_role && !g_sonic_pc.battle_local_ip.empty() &&
+                !g_sonic_pc.battle_peer_ip.empty()) {
+                set_battle_arguments(g_sonic_pc.battle_role, g_sonic_pc.battle_local_ip,
+                                     g_sonic_pc.battle_peer_ip);
+            }
+        }
         std::vector<std::string> arguments = {
             "SonicRush.exe", "--interactive", "--rom", local_path(rom),
             "--freebios", "--generated-firmware", "--boot", "direct",
             "--config", local_path(app_directory / L"game.toml"),
             "--save-path", local_path(user_directory) + "\\sonic-rush.sav",
-            "--runtime-settings-path", local_path(user_directory) + "\\settings.toml",
+            "--runtime-settings-path", runtime_settings,
             "--savestate-dir", local_path(user_directory / L"states"),
             "--no-coverage-manifest", "--network", "off", "--diagnostics", "off"
         };
+        arguments.insert(arguments.end(), battle_arguments.begin(), battle_arguments.end());
         if (!used_remembered_path) remember_rom_path(rom_config, rom);
         std::fprintf(stderr, "[launcher] ROM path: %s\n",
                      used_remembered_path ? "remembered selection" : "new selection");

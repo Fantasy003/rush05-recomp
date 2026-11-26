@@ -1,4 +1,56 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
+enum class SonicScene {
+    Other,
+    Gameplay,
+    Results,
+    Selection,
+};
+
+SonicScene sonic_current_scene() {
+    const auto read_word = [](uint32_t address) {
+        uint32_t word = 0;
+        for (unsigned byte = 0; byte < 4; ++byte)
+            word |= uint32_t{bus_debug_read8(9, address + byte)} << (byte * 8);
+        return word;
+    };
+
+    // The supported USA revision uses a 256-entry ARM9 task pool.
+    // Match both callbacks for tasks in shared overlays. Character select
+    // keeps one destructor while swapping its update during menu transitions.
+    constexpr struct {
+        uint32_t first_update;
+        uint32_t last_update;
+        uint32_t destroy;
+        SonicScene scene;
+    } scene_tasks[] = {
+        {0x02047ecdu, 0x02047ecdu, 0x02047d2du, SonicScene::Results},
+        {0x02358525u, 0x02359625u, 0x02359d15u, SonicScene::Selection}, // character select
+        {0x022d8c45u, 0x022d8c45u, 0x022d8c31u, SonicScene::Selection}, // main menu and Battle Play
+        {0x022e83bdu, 0x022e83bdu, 0x022e8379u, SonicScene::Selection}, // zone map
+        {0x022e129du, 0x022e129du, 0x022e0ee1u, SonicScene::Selection}, // act select
+        {0x022eb5d1u, 0x022eb5d1u, 0x022ebe99u, SonicScene::Selection}, // Time Attack select
+    };
+    SonicScene scene = SonicScene::Other;
+    for (unsigned i = 0; i < 256; ++i) {
+        const uint32_t task = 0x022b49a8u + i * 0x1cu;
+        const uint32_t update = read_word(task + 0x08);
+        const bool stage_object = (update & ~1u) == 0x0206c3d0u;
+        const auto* match = std::find_if(std::begin(scene_tasks), std::end(scene_tasks),
+            [update](const auto& entry) {
+                return entry.first_update <= update && update <= entry.last_update;
+            });
+        if (!stage_object && match == std::end(scene_tasks)) continue;
+        const uint32_t data = read_word(task + 0x10);
+        if (data < 0x02000000u || data >= 0x02400000u || (data & 3u)) continue;
+        if (stage_object) {
+            scene = SonicScene::Gameplay;
+        } else if (read_word(task + 0x0c) == match->destroy) {
+            return match->scene;
+        }
+    }
+    return scene;
+}
+
 bool sonic_apply_pc_video(FrontendPresentation& p, NdsFrontendOptions& options,
                           const SonicPcPreferences* previous = nullptr) {
     const NdsFullscreenMode mode=g_sonic_pc.window_mode==1?NdsFullscreenMode::Exclusive:

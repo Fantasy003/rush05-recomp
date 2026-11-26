@@ -15,15 +15,17 @@ struct RuntimeMenuState {
     bool capture_menu_control = false;
     bool game_language_changed = false;
     bool frame_rate_changed = false;
+    bool battle_changed = false;
 };
 RuntimeMenuState* g_sonic_menu = nullptr;
 const char* sonic_text(const char* english, const char* spanish) {
     return g_sonic_pc.menu_language == 1 ? spanish : english;
 }
-enum SonicMenuSection { Display, Keyboard, Gamepad, MenuKeyboard, MenuGamepad, Languages, System, SectionCount };
+enum SonicMenuSection { Display, Keyboard, Gamepad, MenuKeyboard, MenuGamepad, Languages, Gameplay, BattlePlay, System, SectionCount };
 char g_sonic_sections[SectionCount][24]{};
 char g_sonic_subtitle[24]{};
 char g_sonic_menu_help[48]{};
+char g_sonic_text_help[48]{};
 char g_sonic_key_labels[12][72]{};
 char g_sonic_pad_labels[12][72]{};
 char g_sonic_key_ids[12][40]{};
@@ -58,6 +60,8 @@ const char* kSonicResolutions[] = {"Auto", "640 x 480", "800 x 600",
 const char* kSonicFilters[3]{};
 const char* kSonicBorders[3]{};
 const char* const kSonicLanguages[] = {"English", "Espanol"};
+const char* kSonicTrickJumpChoices[2]{};
+const char* kSonicBattleRoles[3]{};
 
 void sonic_pc_window_pixels(int& width,int& height) {
     static constexpr int sizes[9][2]={{0,0},{640,480},{800,600},{1024,768},
@@ -120,11 +124,15 @@ std::vector<RecompRuntimeUiItem> sonic_build_menu_items() {
         sonic_text("Display","Pantalla"), sonic_text("Keyboard","Teclado"),
         sonic_text("Gamepad","Mando"), sonic_text("PC menu keys","Teclas del menu PC"),
         sonic_text("PC menu pad","Mando del menu PC"), sonic_text("Languages","Idiomas"),
+        sonic_text("Gameplay","Jugabilidad"),
+        sonic_text("Battle Play","Modo batalla"),
         sonic_text("System","Sistema")
     };
     for (unsigned i = 0; i < SectionCount; ++i)
         std::snprintf(g_sonic_sections[i], sizeof(g_sonic_sections[i]), "%s", sections[i]);
     std::snprintf(g_sonic_subtitle, sizeof(g_sonic_subtitle), "%s", sonic_text("PC Settings","Opciones de PC"));
+    std::snprintf(g_sonic_text_help, sizeof(g_sonic_text_help), "%s",
+        sonic_text("Enter saves. Esc cancels.","Enter guarda. Esc cancela."));
     kSonicAspectModes[0] = "Original";
     kSonicAspectModes[1] = sonic_text("Fit-to-Screen","Llenar pantalla");
     kSonicWindows[0] = sonic_text("Windowed","Ventana");
@@ -136,6 +144,11 @@ std::vector<RecompRuntimeUiItem> sonic_build_menu_items() {
     kSonicBorders[0] = sonic_text("Original","Original");
     kSonicBorders[1] = sonic_text("Black","Negro");
     kSonicBorders[2] = sonic_text("Graphite","Grafito");
+    kSonicTrickJumpChoices[0] = sonic_text("Off","No");
+    kSonicTrickJumpChoices[1] = sonic_text("On","Si");
+    kSonicBattleRoles[0] = sonic_text("Offline","Sin red");
+    kSonicBattleRoles[1] = sonic_text("Host","Crear sala");
+    kSonicBattleRoles[2] = sonic_text("Join","Unirse");
 
     std::vector<RecompRuntimeUiItem> items;
     auto choice = [&](const char* key, SonicMenuSection section, const char* label,
@@ -183,6 +196,17 @@ std::vector<RecompRuntimeUiItem> sonic_build_menu_items() {
            sonic_text("Changes the menu immediately.","Cambia el menu en el momento."), kSonicLanguages);
     choice("sonic.game_language", Languages, sonic_text("Game","Juego"),
            sonic_text("Applies when the game next starts.","Se aplica al volver a abrir el juego."), kSonicLanguages);
+    choice("sonic.trick_button_jumps", Gameplay, sonic_text("Jump with Trick","Saltar con Truco"),
+           sonic_text("Off uses only Jump to start a jump.","No: solo Saltar inicia el salto."),
+           kSonicTrickJumpChoices);
+    choice("sonic.battle_role", BattlePlay, sonic_text("Connection","Conexion"),
+           sonic_text("Applies next launch.","Se aplica al reabrir."), kSonicBattleRoles);
+    items.push_back({"sonic.battle_local_ip", g_sonic_sections[BattlePlay],
+        sonic_text("Your IPv4","Tu IPv4"), sonic_text("Your LAN or VPN address.","Tu direccion LAN o VPN."),
+        RECOMP_RUNTIME_UI_TEXT, 0, 15, 0, nullptr, 0, nullptr});
+    items.push_back({"sonic.battle_peer_ip", g_sonic_sections[BattlePlay],
+        sonic_text("Friend's IPv4","IPv4 de tu amigo"), sonic_text("Peer's LAN or VPN address.","Direccion LAN o VPN del otro jugador."),
+        RECOMP_RUNTIME_UI_TEXT, 0, 15, 0, nullptr, 0, nullptr});
     action("sonic.reset_controls",System,sonic_text("Reset controls","Restablecer controles"),
            sonic_text("Restore the default controls.","Recupera los controles originales."));
     action(kRuntimeResumeKey,System,sonic_text("Resume","Reanudar"),
@@ -202,6 +226,8 @@ int* sonic_menu_preference(const char* key) {
     if (std::strcmp(key,"sonic.game_language")==0) return &g_sonic_pc.game_language;
     if (std::strcmp(key,"sonic.aspect_mode")==0) return &g_sonic_pc.aspect_mode;
     if (std::strcmp(key,"sonic.frame_rate")==0) return &g_sonic_pc.frame_rate;
+    if (std::strcmp(key,"sonic.trick_button_jumps")==0) return &g_sonic_pc.trick_button_jumps;
+    if (std::strcmp(key,"sonic.battle_role")==0) return &g_sonic_pc.battle_role;
     return nullptr;
 }
 int runtime_menu_get_value(void*,const RecompRuntimeUiItem* item,int* out) {
@@ -218,6 +244,11 @@ int runtime_menu_set_value(void* context,const RecompRuntimeUiItem* item,int val
     if (!preference) return 0;
     const auto previous = g_sonic_pc;
     *preference = value;
+    if (preference == &g_sonic_pc.trick_button_jumps) return 1;
+    if (preference == &g_sonic_pc.battle_role) {
+        state->battle_changed = true;
+        return 1;
+    }
     if (preference == &g_sonic_pc.frame_rate) {
         state->frame_rate_changed = true;
         return 1;
@@ -245,6 +276,70 @@ int runtime_menu_set_value(void* context,const RecompRuntimeUiItem* item,int val
     return 1;
 }
 void runtime_menu_save(void* context);
+
+std::string* sonic_battle_address(const RecompRuntimeUiItem* item) {
+    if (std::strcmp(item->key, "sonic.battle_local_ip") == 0) return &g_sonic_pc.battle_local_ip;
+    if (std::strcmp(item->key, "sonic.battle_peer_ip") == 0) return &g_sonic_pc.battle_peer_ip;
+    return nullptr;
+}
+
+int runtime_menu_get_text(void*, const RecompRuntimeUiItem* item, char* buffer, size_t size) {
+    const auto* address = sonic_battle_address(item);
+    if (!address) return 0;
+    std::snprintf(buffer, size, "%s", address->c_str());
+    return 1;
+}
+
+int runtime_menu_set_text(void* context, const RecompRuntimeUiItem* item, const char* value) {
+    auto* state = static_cast<RuntimeMenuState*>(context);
+    auto* address = sonic_battle_address(item);
+    if (!state || !address) return 0;
+    if (*value && !sonic_pc_battle_ipv4(value)) {
+        recomp_runtime_ui_set_status(state->ui, sonic_text("Invalid IPv4 address","Direccion IPv4 invalida"));
+        return 0;
+    }
+    *address = value;
+    state->battle_changed = true;
+    return 1;
+}
+
+void sonic_enter_address_text(RecompRuntimeUi* ui, std::string_view text) {
+    const auto first = text.find_first_not_of(" \t\r\n");
+    if (first == std::string_view::npos) return;
+    const auto value = text.substr(first, text.find_last_not_of(" \t\r\n") - first + 1);
+    if (value.size() <= 15 && value.find_first_not_of("0123456789.") == std::string_view::npos)
+        recomp_runtime_ui_insert_text(ui, std::string(value).c_str());
+}
+
+void sonic_handle_address_key(RecompRuntimeUi* ui, SDL_Scancode code, SDL_Keycode key,
+                              SDL_Keymod mod) {
+    if (code == SDL_SCANCODE_ESCAPE)
+        recomp_runtime_ui_edit_text(ui, RECOMP_RUNTIME_UI_TEXT_CANCEL);
+    else if (code == SDL_SCANCODE_RETURN || code == SDL_SCANCODE_KP_ENTER)
+        recomp_runtime_ui_edit_text(ui, RECOMP_RUNTIME_UI_TEXT_CONFIRM);
+    else if (code == SDL_SCANCODE_BACKSPACE || code == SDL_SCANCODE_DELETE)
+        recomp_runtime_ui_edit_text(ui, RECOMP_RUNTIME_UI_TEXT_BACKSPACE);
+    else if ((mod & SDL_KMOD_CTRL) && code == SDL_SCANCODE_A)
+        recomp_runtime_ui_edit_text(ui, RECOMP_RUNTIME_UI_TEXT_SELECT_ALL);
+    else if ((mod & SDL_KMOD_CTRL) && code == SDL_SCANCODE_V) {
+        char* clipboard = SDL_GetClipboardText();
+        if (clipboard) {
+            sonic_enter_address_text(ui, clipboard);
+            SDL_free(clipboard);
+        }
+    } else if (!(mod & (SDL_KMOD_CTRL | SDL_KMOD_ALT | SDL_KMOD_GUI))) {
+        if (key == SDLK_UNKNOWN) key = SDL_GetKeyFromScancode(code, mod, true);
+        char digit = 0;
+        if (key >= SDLK_0 && key <= SDLK_9) digit = static_cast<char>('0' + key - SDLK_0);
+        else if (key >= SDLK_KP_1 && key <= SDLK_KP_9) digit = static_cast<char>('1' + key - SDLK_KP_1);
+        else if (key == SDLK_KP_0) digit = '0';
+        else if (key == SDLK_PERIOD || key == SDLK_KP_PERIOD || key == SDLK_KP_DECIMAL) digit = '.';
+        if (digit) {
+            const char value[] = {digit, 0};
+            recomp_runtime_ui_insert_text(ui, value);
+        }
+    }
+}
 
 int runtime_menu_run_action(void* context,const RecompRuntimeUiItem* item) {
     auto* state=static_cast<RuntimeMenuState*>(context);if(!state||!item)return 0;
@@ -276,13 +371,22 @@ int runtime_menu_is_enabled(void*,const RecompRuntimeUiItem*) {return 1;}
 void runtime_menu_save(void* context) {
     auto* state=static_cast<RuntimeMenuState*>(context);if(!state)return;
     const bool restart_notice = state->game_language_changed;
+    const bool battle_notice = state->battle_changed;
     const bool refresh_notice = state->frame_rate_changed && g_sonic_pc.frame_rate == 2 &&
                                 state->supports_high_refresh && !state->supports_high_refresh();
     state->game_language_changed = false;
     state->frame_rate_changed = false;
+    state->battle_changed = false;
     const bool saved = sonic_pc_save(state->settings_path);
     if (!state->ui) return;
     if (!saved) recomp_runtime_ui_set_status(state->ui,sonic_text("Could not save settings","No se pudieron guardar las opciones"));
+    else if (battle_notice) {
+        const bool incomplete = g_sonic_pc.battle_role &&
+            (g_sonic_pc.battle_local_ip.empty() || g_sonic_pc.battle_peer_ip.empty());
+        recomp_runtime_ui_set_status(state->ui, incomplete
+            ? sonic_text("Enter both IPv4 addresses","Completa ambas IPv4")
+            : sonic_text("Saved. Reopen the game.","Guardado. Volve a abrir el juego."));
+    }
     else if (restart_notice) recomp_runtime_ui_set_status(state->ui,sonic_text("Applies next launch","Se aplica al reabrir"));
     else if (refresh_notice) recomp_runtime_ui_set_status(state->ui,sonic_text("120 Hz needed. Using 60 FPS.","Faltan 120 Hz. Se usan 60 FPS."));
     else recomp_runtime_ui_set_status(state->ui,sonic_text("Saved","Guardado"));
@@ -303,22 +407,4 @@ bool sonic_capture_binding(RuntimeMenuState& state,bool keyboard,int code) {
     if(!ok) {if(state.ui)recomp_runtime_ui_set_status(state.ui,sonic_text("Reserved. Choose another.","Entrada reservada. Elegi otra."));return true;}
     state.capture_kind=0;sonic_refresh_binding_labels();runtime_menu_save(&state);
     return true;
-}
-
-// The USA game owns a 256-task pool; each task is 0x1c bytes. Only follow
-// its live stage-object update tasks, rather than mistaking a menu's 3D logo
-// or character preview for active gameplay. Reads stay in main RAM, without IO.
-bool sonic_player_task_active() {
-    auto word=[](uint32_t address) {
-        uint32_t result=0;
-        for(unsigned b=0;b<4;++b)result|=uint32_t{bus_debug_read8(9,address+b)}<<(b*8);
-        return result;
-    };
-    for(unsigned i=0;i<256;++i) {
-        const uint32_t node=0x022b49a8u+i*0x1cu;
-        if((word(node+8)&~1u)!=0x0206c3d0u)continue;
-        const uint32_t data=word(node+0x10);
-        if(data>=0x02000000u && data<0x02400000u && !(data&3u))return true;
-    }
-    return false;
 }

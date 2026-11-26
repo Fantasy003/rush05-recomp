@@ -53,7 +53,7 @@
 +bool nds_apply_user_language(std::vector<uint8_t>& fw, unsigned language);
 --- a/runner/src/frontend.cpp
 +++ b/runner/src/frontend.cpp
-@@ -1,4 +1,10 @@
+@@ -1,4 +1,11 @@
 +// Modified for rush05-recomp by ChatGPT in 2026. See NOTICE.md for scope.
  #include "frontend.h"
 +#include "sonic_pc_settings.h"
@@ -61,10 +61,11 @@
 +#include "sonic_screen_layout.h"
 +#include "state.h"
 +#include <functional>
++#include <string_view>
  #include "host_profile.h"
  
  #include <algorithm>
-@@ -269,6 +275,15 @@
+@@ -269,6 +276,15 @@
  
  constexpr int kScreenWidth = 256;
  constexpr int kScreenHeight = 192;
@@ -80,7 +81,7 @@
  
  enum class MphPrimeInputKind : uint8_t {
      None,
-@@ -866,43 +881,8 @@
+@@ -866,43 +882,8 @@
  #endif
  }
  
@@ -126,7 +127,7 @@
  
  SDL_GameController* open_first_controller() {
  #if defined(NDS_HAVE_SDL3)
-@@ -936,10 +916,12 @@
+@@ -936,10 +917,12 @@
  void set_touch_from_mouse(float x, float y, bool down,
                            NdsScreenLayout layout, int logical_width) {
      // Coordinates are expected in the renderer's logical DS-space.
@@ -143,7 +144,7 @@
      if (!down || x < left || x >= left + kScreenWidth ||
          y < bottom_origin || y >= bottom_origin + kScreenHeight) {
          nds_set_touch(0, 0, false);
-@@ -1128,175 +1110,37 @@
+@@ -1128,175 +1111,37 @@
      return hash;
  }
  
@@ -344,7 +345,7 @@
  }
  
  const uint32_t* runtime_menu_overlay(RecompRuntimeUi* ui,
-@@ -1328,6 +1172,12 @@
+@@ -1328,6 +1173,12 @@
      int canvas_width = kScreenWidth;
      int configured_sample_scale = 1;
      int sample_scale = 1;
@@ -357,7 +358,7 @@
  };
  
  // docs/frame_interpolation.md, MVP blend mode. Holds the previous DS frame's
-@@ -1381,6 +1231,10 @@
+@@ -1381,6 +1232,10 @@
  #endif
  
  void destroy_presentation(FrontendPresentation& presentation) {
@@ -368,7 +369,7 @@
      for (SDL_Texture*& texture : presentation.sample_targets) {
          if (texture) SDL_DestroyTexture(texture);
          texture = nullptr;
-@@ -1467,16 +1321,46 @@
+@@ -1467,16 +1322,46 @@
  
  bool set_window_fullscreen(SDL_Window* window, NdsFullscreenMode mode) {
  #if defined(NDS_HAVE_SDL3)
@@ -418,7 +419,7 @@
  #else
      return SDL_RenderSetLogicalSize(renderer, width, height) == 0;
  #endif
-@@ -1725,8 +1609,8 @@
+@@ -1725,8 +1610,8 @@
          (presentation.gl_top
               ? static_cast<uint64_t>(SDL_WINDOW_OPENGL) : 0u);
      presentation.windows[0] = create_window(
@@ -429,7 +430,7 @@
          SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED,
          (presentation.separate ? presentation.screen_widths[0]
                                 : presentation.canvas_width) * kWindowScale,
-@@ -1750,7 +1634,7 @@
+@@ -1750,7 +1635,7 @@
          int top_y = 0;
          SDL_GetWindowPosition(presentation.windows[0], &top_x, &top_y);
          presentation.windows[1] = create_window(
@@ -438,7 +439,7 @@
              top_x + presentation.screen_widths[0] * kWindowScale + 32,
              top_y,
              presentation.screen_widths[1] * kWindowScale,
-@@ -1853,10 +1737,13 @@
+@@ -1853,10 +1738,13 @@
      return true;
  }
  
@@ -453,14 +454,15 @@
      if (presentation.sample_scale > 1 && presentation.sample_targets[screen]) {
          SDL_SetRenderTarget(renderer, presentation.sample_targets[screen]);
          SDL_SetRenderDrawColor(renderer, 0, 0, 0, 255);
-@@ -1963,33 +1850,73 @@
+@@ -1963,33 +1851,80 @@
  #endif
          return ticks;
      }
 -    top_pixels = runtime_menu_overlay(
 -        runtime_ui, top_pixels, top_width, kScreenHeight);
 +    g_sonic_main_screen=nds_gpu2d_presented_main_screen();
-+    g_sonic_player_active=sonic_player_task_active();
++    const SonicScene scene = sonic_current_scene();
++    g_sonic_player_active = scene == SonicScene::Gameplay;
 +    const bool fit = g_sonic_pc.aspect_mode == 1;
 +    const bool menu_open = runtime_ui && recomp_runtime_ui_is_open(runtime_ui);
 +    // The DS pause flag is set while its own pause overlay is shown. That
@@ -468,8 +470,13 @@
 +    const bool game_paused = fit && g_sonic_player_active &&
 +        (bus_debug_read8(9, 0x022c4ef0u) & 1u) != 0;
 +    const bool force_dual = fit && (menu_open || game_paused);
++    const bool stack_screens = scene == SonicScene::Selection && !menu_open;
++    // The stage-clear task draws its score and rank on engine A.
++    // Use its LCD destination from the same published framebuffer.
++    const bool focus_scene = g_sonic_player_active ||
++        (fit && scene == SonicScene::Results);
 +    const int focus = sonic_pc_focus_screen(g_sonic_pc.screen_mode != 0,
-+        g_sonic_player_active && !force_dual, g_sonic_main_screen);
++        focus_scene && !force_dual, g_sonic_main_screen);
 +    if(focus!=g_sonic_focus_screen){
 +        std::fprintf(stderr,"[sonic-pc] Focus %d (player=%u, main=%d)\n",focus,g_sonic_player_active?1u:0u,g_sonic_main_screen);
 +        nds_set_touch(0,0,false);
@@ -483,11 +490,11 @@
 +    else top_pixels=runtime_menu_overlay(runtime_ui,top_pixels,top_width,kScreenHeight);
 +    int output_width = 0;
 +    int output_height = 0;
-+    if (!presentation.separate && focus < 0 && fit)
++    if (!presentation.separate && focus < 0 && fit && !stack_screens)
 +        SDL_GetRenderOutputSize(presentation.renderers[0], &output_width, &output_height);
 +    const auto layout = sonic_screen_layout(output_width, output_height,
 +        presentation.screen_widths[0], presentation.screen_widths[1],
-+        kScreenHeight, sonic_frame_padding(), focus, fit);
++        kScreenHeight, sonic_frame_padding(), focus, fit && !stack_screens);
 +    if (!presentation.separate && (presentation.sonic_logical_width != layout.width ||
 +                                  presentation.sonic_logical_height != layout.height ||
 +                                  presentation.sonic_fills_output != layout.fill_output)) {
@@ -497,6 +504,7 @@
 +            ticks.ok = false;
 +            return ticks;
 +        }
++        nds_set_touch(0, 0, false);
 +        presentation.sonic_logical_width = layout.width;
 +        presentation.sonic_logical_height = layout.height;
 +        presentation.sonic_fills_output = layout.fill_output;
@@ -548,7 +556,7 @@
          ticks.draw += SDL_GetPerformanceCounter() - start;
          start = SDL_GetPerformanceCounter();
          SDL_RenderPresent(renderer);
-@@ -2022,6 +1949,12 @@
+@@ -2022,6 +1957,12 @@
  
  int nds_run_interactive_frontend(const NdsFrontendOptions& initial_options) {
      NdsFrontendOptions options = initial_options;
@@ -561,7 +569,7 @@
      SDL_SetMainReady();
      // SDL_INIT_TIMER matters on Windows: it raises the OS timer resolution
      // to 1 ms (SDL_HINT_TIMER_RESOLUTION default). Without it SDL_Delay(1)
-@@ -2048,6 +1981,13 @@
+@@ -2048,6 +1989,13 @@
          SDL_Quit();
          return 1;
      }
@@ -575,7 +583,7 @@
      const int bottom_logical_width = presentation.separate
          ? presentation.screen_widths[1]
          : presentation.canvas_width;
-@@ -2055,10 +1995,6 @@
+@@ -2055,10 +2003,6 @@
          (bottom_logical_width - kScreenWidth) / 2;
      const int top_content_left = presentation.separate
          ? 0 : (presentation.canvas_width - presentation.screen_widths[0]) / 2;
@@ -586,7 +594,7 @@
      std::fprintf(stderr,
          "[sdl] layout=%s fullscreen=%s adaptive=%s supersampling=%ux aa=%ux "
          "internal=%ux\n",
-@@ -2158,60 +2094,25 @@
+@@ -2158,60 +2102,25 @@
          return 1;
      }
  
@@ -664,7 +672,7 @@
  
      AudioQueue audio_queue{};
      SDL_AudioSpec want{};
-@@ -2333,24 +2234,25 @@
+@@ -2333,38 +2242,41 @@
      publish_keys();
      nds_set_touch(0, 0, false);
      bool running = true;
@@ -698,6 +706,7 @@
 +    runtime_menu_config.title = "Sonic Rush";
 +    runtime_menu_config.subtitle = g_sonic_subtitle;
 +    runtime_menu_config.navigation_help = g_sonic_menu_help;
++    runtime_menu_config.text_edit_help = g_sonic_text_help;
 +    runtime_menu_config.items = runtime_menu_state.items.data();
      runtime_menu_config.item_count =
 -        sizeof(runtime_menu_items) / sizeof(runtime_menu_items[0]);
@@ -705,7 +714,13 @@
      runtime_menu_config.callbacks.context = &runtime_menu_state;
      runtime_menu_config.callbacks.get_value = runtime_menu_get_value;
      runtime_menu_config.callbacks.set_value = runtime_menu_set_value;
-@@ -2362,9 +2264,8 @@
+     runtime_menu_config.callbacks.run_action = runtime_menu_run_action;
+     runtime_menu_config.callbacks.is_enabled = runtime_menu_is_enabled;
+     runtime_menu_config.callbacks.save = runtime_menu_save;
++    runtime_menu_config.callbacks.get_text = runtime_menu_get_text;
++    runtime_menu_config.callbacks.set_text = runtime_menu_set_text;
+     runtime_menu_config.theme = "nds";
+     runtime_menu_config.accept_label = "A / Enter";
      runtime_menu_config.back_label = "B / Backspace";
      RecompRuntimeUi* runtime_ui =
          recomp_runtime_ui_create(&runtime_menu_config);
@@ -717,7 +732,7 @@
      bool compute_failed = false;
      bool mouse_down = false;
      bool touch_release_pending = false;
-@@ -2653,6 +2554,7 @@
+@@ -2653,6 +2565,7 @@
          std::fprintf(stderr, "[sdl] relative mouse captured\n");
      };
      uint64_t shown_frames = 0;
@@ -725,7 +740,7 @@
      uint64_t synthetic_presents = 0;
      FrameBlendCache blend_cache{};
      uint64_t fps_frames = 0;
-@@ -2712,15 +2614,17 @@
+@@ -2712,15 +2625,17 @@
      };
      auto finish_runtime_menu_input = [&](bool was_open) {
          if (runtime_menu_state.close_requested) {
@@ -745,7 +760,18 @@
      uint64_t host_key_presses = 0;
      uint64_t host_touch_presses = 0;
      int last_touch_event_x = -1;
-@@ -3066,6 +2970,10 @@
+@@ -3063,9 +2978,21 @@
+                              (int)event.key.repeat);
+             }
+             if (event.type == SDL_KEYDOWN || event.type == SDL_KEYUP) {
++                if (recomp_runtime_ui_wants_text_input(runtime_ui)) {
++                    if (event.type == SDL_KEYDOWN && (!event.key.repeat ||
++                        event.key.scancode == SDL_SCANCODE_BACKSPACE)) {
++                        sonic_handle_address_key(runtime_ui, sdl_event_scancode(event),
++                                                 event.key.key, event.key.mod);
++                    }
++                    continue;
++                }
                  RecompRuntimeUiInput menu_input{};
                  const SDL_Scancode scancode = sdl_event_scancode(event);
                  const bool was_open = runtime_menu_open();
@@ -756,13 +782,24 @@
                  const bool known = runtime_menu_key_input(
                      scancode, &menu_input);
                  if (known && runtime_ui &&
-@@ -3219,8 +3127,16 @@
+@@ -3219,8 +3146,27 @@
                  event.type == SDL_CONTROLLERBUTTONUP) {
                  RecompRuntimeUiInput menu_input{};
                  const bool was_open = runtime_menu_open();
 -                const auto button = static_cast<SDL_GameControllerButton>(
 -                    sdl_controller_button(event));
 +                const auto button = static_cast<SDL_GameControllerButton>(sdl_controller_button(event));
++                if (recomp_runtime_ui_wants_text_input(runtime_ui)) {
++                    if (event.type == SDL_CONTROLLERBUTTONDOWN &&
++                        runtime_menu_controller_input(button, &menu_input)) {
++                        if (menu_input == RECOMP_RUNTIME_UI_INPUT_ACCEPT)
++                            recomp_runtime_ui_edit_text(runtime_ui, RECOMP_RUNTIME_UI_TEXT_CONFIRM);
++                        else if (menu_input == RECOMP_RUNTIME_UI_INPUT_BACK ||
++                                 menu_input == RECOMP_RUNTIME_UI_INPUT_TOGGLE)
++                            recomp_runtime_ui_edit_text(runtime_ui, RECOMP_RUNTIME_UI_TEXT_CANCEL);
++                    }
++                    continue;
++                }
 +                if(was_open && runtime_menu_state.capture_kind){
 +                    if(event.type==SDL_CONTROLLERBUTTONDOWN)sonic_capture_binding(runtime_menu_state,false,button);
 +                    continue;
@@ -775,7 +812,7 @@
                  if (runtime_menu_controller_input(button, &menu_input) &&
                      runtime_ui &&
                      recomp_runtime_ui_handle_input(
-@@ -3280,6 +3196,12 @@
+@@ -3280,6 +3226,12 @@
              const bool relative_left_down =
                  primary_left_down ||
                  (bottom_left_down && mph_prime_unified_window_focus);
@@ -788,16 +825,17 @@
              const NdsStackedRelativeMouseRoute stacked_left_route =
                  primary_left_down && !presentation.separate
                      ? nds_route_stacked_relative_mouse_button(
-@@ -3482,7 +3404,7 @@
+@@ -3482,7 +3434,8 @@
                      RECOMP_RUNTIME_UI_INPUT_DOWN;
                  const float ax = std::fabs(lx);
                  const float ay = std::fabs(ly);
 -                if (std::max(ax, ay) > 0.5f) {
-+                if (runtime_menu_state.capture_kind==0 && std::max(ax, ay) > 0.5f) {
++                if (runtime_menu_state.capture_kind == 0 &&
++                    !recomp_runtime_ui_wants_text_input(runtime_ui) && std::max(ax, ay) > 0.5f) {
                      have_stick_input = true;
                      if (ax > ay)
                          stick_input = lx > 0.0f
-@@ -3751,11 +3673,19 @@
+@@ -3751,11 +3704,19 @@
          }
          publish_input_debug();
  
@@ -818,7 +856,7 @@
                 !(scheduler_cpu_terminal_halted(0) &&
                   scheduler_cpu_terminal_halted(1))) {
              scheduler_run_round();
-@@ -3805,6 +3735,34 @@
+@@ -3805,6 +3766,34 @@
          }
  
          const uint64_t phase1 = SDL_GetPerformanceCounter();
@@ -853,7 +891,7 @@
          const uint32_t* const native_top = nds_gpu2d_framebuffer(0);
          const uint32_t* top_pixels = native_top;
          const uint32_t* bottom_pixels = nds_gpu2d_framebuffer(1);
-@@ -3832,18 +3790,21 @@
+@@ -3832,18 +3821,21 @@
          // here: this only re-presents pixels that already exist. The direct
          // presenter is excluded above; direct-present frames are excluded
          // again per frame because their top surface lives on the GPU.
@@ -880,7 +918,7 @@
              const PresentationTicks synthetic_ticks = present_screens(
                  presentation, blend_cache.blended[0].data(), top_width,
                  blend_cache.blended[1].data(), bottom_width,
-@@ -3862,33 +3823,39 @@
+@@ -3862,33 +3854,39 @@
              // phase_present_ticks is measured from phase1, which already
              // encloses this block; only the sub-counters need folding in.
              ++synthetic_presents;
@@ -938,7 +976,7 @@
              !nds_gpu2d_direct_present_frame_active()) {
              cache_presented_frame(blend_cache, 0, top_pixels, top_width);
              cache_presented_frame(blend_cache, 1, bottom_pixels, bottom_width);
-@@ -3915,9 +3882,10 @@
+@@ -3915,9 +3913,10 @@
          if (turbo_active) {
              discard_spu_output();
          } else {
@@ -951,7 +989,7 @@
          }
          const uint64_t frame_drain_ticks =
              SDL_GetPerformanceCounter() - phase2;
-@@ -4003,7 +3971,6 @@
+@@ -4003,7 +4002,6 @@
          }
  
          ++shown_frames;
@@ -959,7 +997,7 @@
          g_live_stats.frames = shown_frames;
          g_live_stats.emu_ticks = phase_emu_ticks;
          g_live_stats.present_ticks = phase_present_ticks;
-@@ -4013,7 +3980,7 @@
+@@ -4013,7 +4011,7 @@
          g_live_stats.swap_ticks = phase_swap_ticks;
          g_live_stats.drain_ticks = phase_drain_ticks;
          g_live_stats.underruns = current_underruns;
@@ -968,7 +1006,7 @@
          g_live_stats.synthetic_presents = synthetic_presents;
          g_live_stats.perf_governor_stage = perf_governor.stage;
          g_live_stats.perf_governor_over_frames = perf_governor.over_frames;
-@@ -4045,16 +4012,16 @@
+@@ -4045,16 +4043,16 @@
                            (perf_governor.stage2_held ? " held" : "")
                      : "";
              const std::string top_title = !savestate_notice.empty()
@@ -989,7 +1027,7 @@
                      governor_text;
                  SDL_SetWindowTitle(presentation.windows[1],
                                     bottom_title.c_str());
-@@ -4107,6 +4074,7 @@
+@@ -4107,6 +4105,7 @@
          recomp_runtime_ui_destroy(runtime_ui);
          runtime_ui = nullptr;
      }
@@ -997,7 +1035,7 @@
      destroy_presentation(presentation);
      SDL_Quit();
      std::fprintf(stderr, "[sdl] closed after %llu presented frames\n",
-@@ -4155,10 +4123,11 @@
+@@ -4155,10 +4154,11 @@
          std::fprintf(stderr,
              "[sdl] frame interpolation: mode=%s active=%u refresh=%dHz "
              "min_refresh=%dHz real_presents=%llu synthetic_presents=%llu\n",
@@ -1011,7 +1049,7 @@
              static_cast<unsigned long long>(synthetic_presents));
          nds_profile_report(stderr);
      }
-@@ -4306,12 +4275,13 @@
+@@ -4306,12 +4306,13 @@
      event.button.down = down;
  #endif
      event.button.clicks = 1;
@@ -1031,7 +1069,7 @@
      const bool pushed = sdl_push_event(event);
      if (pushed) ++g_input_debug.debug_touch_events;
      else ++g_input_debug.debug_event_errors;
-@@ -4409,3 +4379,53 @@
+@@ -4409,3 +4410,55 @@
      if (after - from > kFrameDigestRing) return 0;
      return copied;
  }
@@ -1072,7 +1110,9 @@
 +        ",\"output_height\":"+std::to_string(output_height)+
 +        ",\"filter\":"+std::to_string(g_sonic_pc.filter)+
 +        ",\"menu_open\":"+std::to_string(g_sonic_menu && g_sonic_menu->ui && recomp_runtime_ui_is_open(g_sonic_menu->ui)?1:0)+
-+        ",\"capture\":"+std::to_string(g_sonic_menu?g_sonic_menu->capture_kind:0);
++        ",\"capture\":"+std::to_string(g_sonic_menu?g_sonic_menu->capture_kind:0)+
++        ",\"text_edit\":"+std::to_string(g_sonic_menu ?
++            recomp_runtime_ui_wants_text_input(g_sonic_menu->ui) : 0);
 +    auto bindings=[&](const char* name,const auto& values){
 +        out+=",\"";out+=name;out+="\":[";
 +        for(size_t i=0;i<values.size();++i){if(i)out+=',';out+=std::to_string(values[i]);}
@@ -1251,10 +1291,57 @@
      // stderr is the runner's diagnostic stream and is read from files by
      // harnesses and field-bundle collectors. Under Windows UCRT a redirected
      // stderr becomes BLOCK buffered, so a force-killed process loses its tail
-@@ -2024,6 +2026,17 @@
-             "(LLE-faithful, reads real firmware dump over SPI)\n");
-     }
+@@ -439,6 +441,8 @@
+     std::string cli_wfc_provider;
+     std::string cli_local_wireless_enabled;
+     std::string cli_local_wireless_base_port;
++    std::string cli_local_wireless_bind;
++    std::string cli_local_wireless_peer;
+     // Wiimmfi M8: capture/replay at the Ethernet backend boundary.
+     std::string cli_net_capture_out;
+     std::string cli_net_capture_in;
+@@ -626,6 +630,10 @@
+             cli_wfc_provider = argv[++i];
+         } else if (a == "--local-wireless" && i + 1 < argc) {
+             cli_local_wireless_enabled = argv[++i];
++        } else if (a == "--local-wireless-bind" && i + 1 < argc) {
++            cli_local_wireless_bind = argv[++i];
++        } else if (a == "--local-wireless-peer" && i + 1 < argc) {
++            cli_local_wireless_peer = argv[++i];
+         } else if (a == "--local-wireless-port" && i + 1 < argc) {
+             cli_local_wireless_base_port = argv[++i];
+         } else if (a == "--net-capture-out" && i + 1 < argc) {
+@@ -717,6 +725,7 @@
+                 "[--wfc on|off] "
+                 "[--wfc-provider kaeru|wiimmfi|wiimmfi-direct|local|<ipv4>] "
+                 "[--local-wireless on|off] [--local-wireless-port 1024..65520] "
++                "[--local-wireless-bind IPv4 --local-wireless-peer IPv4] "
+                 "[--net-capture-out FILE] [--net-capture-in FILE] "
+                 "[--net-capture-raw] [--net-capture-no-pcap] "
+                 "[--net-capture-scenario NAME] "
+@@ -1289,6 +1298,16 @@
+         frontend_options.instance_index;
+     resolved_network.local_wireless_base_port =
+         frontend_options.local_wireless.base_port;
++    if (!cli_local_wireless_bind.empty() || !cli_local_wireless_peer.empty()) {
++        if (!resolved_network.local_wireless_enabled ||
++            resolved_network.local_wireless_instance > 1 ||
++            !sonic_pc_battle_ipv4(cli_local_wireless_bind, &resolved_network.local_wireless_bind_ipv4) ||
++            !sonic_pc_battle_ipv4(cli_local_wireless_peer, &resolved_network.local_wireless_peer_ipv4)) {
++            std::fprintf(stderr, "Direct Battle Play requires --local-wireless on, "
++                "--instance-index 0 or 1, and both local and peer unicast IPv4 addresses.\n");
++            return 2;
++        }
++    }
  
+     // Resolve the user-facing backend name to the bridge enum. Replay is
+     // always available; pcap is available only in builds that opt into the
+@@ -2022,6 +2041,17 @@
+         std::fprintf(stderr,
+             "[firmware] instance index 0: guest MAC left untouched "
+             "(LLE-faithful, reads real firmware dump over SPI)\n");
++    }
++
 +    if (!frontend_options.runtime_settings_path.empty() &&
 +        rom_sha1 == "bc617530bb9b6e4179f2e54d7816c38676812dde") {
 +        sonic_pc_load(sonic_pc_settings_path(frontend_options.runtime_settings_path));
@@ -1264,11 +1351,9 @@
 +            return 1;
 +        }
 +        std::fprintf(stderr, "[firmware] Game language: %s\n", language == 5u ? "Spanish" : "English");
-+    }
-+
+     }
+ 
      // Full power-on init, reusable so the debug server can honour `reset`
-     // (the bisector compares fresh-from-reset at each event count).
-     auto boot = [&]() {
 --- a/runner/src/scheduler.cpp
 +++ b/runner/src/scheduler.cpp
 @@ -1,3 +1,4 @@
@@ -1293,3 +1378,238 @@
  
      const uint64_t spu = (g_sys_timestamp / 1024u + 1u) * 1024u;
  
+--- a/runner/src/wifi_net.h
++++ b/runner/src/wifi_net.h
+@@ -133,6 +133,9 @@
+     bool local_wireless_enabled = false;
+     uint32_t local_wireless_instance = 0;
+     uint16_t local_wireless_base_port = 26710;
++    // Host-order IPv4. Zero retains the same-machine transport.
++    uint32_t local_wireless_bind_ipv4 = 0;
++    uint32_t local_wireless_peer_ipv4 = 0;
+ };
+ 
+ // Wiimmfi M8: query surface for a --network-backend replay run's outcome.
+--- a/runner/src/wifi_net.cpp
++++ b/runner/src/wifi_net.cpp
+@@ -744,10 +744,13 @@
+ 
+ class LocalMpTransport {
+ public:
+-    void Configure(bool enabled, uint32_t instance, uint16_t base_port) {
++    void Configure(bool enabled, uint32_t instance, uint16_t base_port,
++                   uint32_t bind_ipv4, uint32_t peer_ipv4) {
+         enabled_ = enabled && instance < kMaxInstances;
+         instance_ = instance;
+         base_port_ = base_port;
++        bind_ipv4_ = bind_ipv4;
++        peer_ipv4_ = peer_ipv4;
+     }
+ 
+     void Begin() {
+@@ -770,12 +773,12 @@
+ 
+         sockaddr_in addr{};
+         addr.sin_family = AF_INET;
+-        addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
++        addr.sin_addr.s_addr = htonl(peer_ipv4_ ? bind_ipv4_ : INADDR_LOOPBACK);
+         addr.sin_port = htons(static_cast<uint16_t>(base_port_ + instance_));
+         if (::bind(socket_, reinterpret_cast<sockaddr*>(&addr),
+                    sizeof(addr)) == SOCKET_ERROR) {
+             melonDS::Platform::Log(melonDS::Platform::Error,
+-                "[local_mp] bind 127.0.0.1:%u failed: %d\n",
++                "[local_mp] bind UDP port %u failed: %d\n",
+                 static_cast<unsigned>(base_port_ + instance_),
+                 WSAGetLastError());
+             CloseSocket();
+@@ -790,6 +793,19 @@
+             return;
+         }
+ 
++        if (peer_ipv4_) {
++            sockaddr_in peer{};
++            peer.sin_family = AF_INET;
++            peer.sin_addr.s_addr = htonl(peer_ipv4_);
++            peer.sin_port = htons(static_cast<uint16_t>(base_port_ + (instance_ ^ 1u)));
++            // A connected UDP socket accepts datagrams only from this endpoint.
++            if (::connect(socket_, reinterpret_cast<sockaddr*>(&peer), sizeof(peer)) == SOCKET_ERROR) {
++                melonDS::Platform::Log(melonDS::Platform::Error,
++                    "[local_mp] could not set the Battle Play peer: %d\n", WSAGetLastError());
++                CloseSocket();
++                return;
++            }
++        }
+         melonDS::Platform::Log(melonDS::Platform::Info,
+             "[local_mp] enabled instance=%u port=%u\n",
+             static_cast<unsigned>(instance_),
+@@ -840,7 +856,7 @@
+     uint16_t RecvReplies(uint8_t* data, uint64_t timestamp, uint16_t aidmask) {
+         uint16_t received = 0;
+         const auto start = std::chrono::steady_clock::now();
+-        const auto deadline = start + std::chrono::milliseconds(25);
++        const auto deadline = start + std::chrono::milliseconds(peer_ipv4_ ? 100 : 25);
+         stats_recv_replies_calls_.fetch_add(1, std::memory_order_relaxed);
+         for (;;) {
+             DrainSocket();
+@@ -861,7 +877,7 @@
+                 }
+                 continue;
+             }
+-            if (frame.timestamp + 32u < timestamp) {
++            if (frame.timestamp < timestamp && timestamp - frame.timestamp > 32u) {
+                 stats_stale_reply_drops_.fetch_add(1,
+                                                    std::memory_order_relaxed);
+                 continue;
+@@ -916,12 +932,28 @@
+     static constexpr uint32_t kMagic = 0x4946494Eu;
+     static constexpr uint32_t kMaxInstances = 16;
+     static constexpr uint32_t kHeaderBytes = 24;
+-    static constexpr size_t kMaxFrameBytes = 0x948;
++    // Capacities of the vendored Wifi::RXBuffer and each MP client reply slot.
++    static constexpr size_t kMaxFrameBytes = 2048;
++    static constexpr size_t kReplySlotBytes = 1024;
++    static constexpr size_t kTxHeaderBytes = 12;
++
++    static bool IsValidFrame(uint32_t type, const uint8_t* data, size_t size) {
++        const uint32_t kind = type & 0xFFFFu;
++        const uint32_t aid = type >> 16u;
++        if (kind > 3 || (kind == 2 ? aid > 15 : aid != 0)) return false;
++        if (size == 0) return kind == 2;
++        const size_t capacity = kind == 2 ? kReplySlotBytes : kMaxFrameBytes;
++        if (!data || size < kTxHeaderBytes + 24 || size > capacity) return false;
++        if ((size_t{data[10]} | (size_t{data[11]} << 8)) != size - kTxHeaderBytes)
++            return false;
++        // The vendored receive path shifts WEP data from 28 bytes into the frame.
++        return !(data[kTxHeaderBytes + 1] & 0x40) || size <= kMaxFrameBytes - 28;
++    }
+     static constexpr size_t kQueueCapacity = 1024;
+ 
+     int RecvPacketGeneric(uint8_t* data, uint64_t* timestamp, bool block) {
+         const auto start = std::chrono::steady_clock::now();
+-        const auto deadline = start + std::chrono::milliseconds(25);
++        const auto deadline = start + std::chrono::milliseconds(peer_ipv4_ ? 100 : 25);
+         if (block)
+             stats_recv_host_calls_.fetch_add(1, std::memory_order_relaxed);
+         for (;;) {
+@@ -1021,6 +1053,14 @@
+         if (len > 0)
+             datagram.insert(datagram.end(), data, data + len);
+ 
++        if (peer_ipv4_) {
++            if (::send(socket_, reinterpret_cast<const char*>(datagram.data()),
++                       static_cast<int>(datagram.size()), 0) == SOCKET_ERROR)
++                return 0;
++            stats_frames_sent_.fetch_add(1, std::memory_order_relaxed);
++            return len;
++        }
++
+         int sent = 0;
+         for (uint32_t i = 0; i < kMaxInstances; ++i) {
+             if (i == instance_) continue;
+@@ -1056,18 +1096,16 @@
+     void DrainSocket() {
+ #ifdef _WIN32
+         if (!enabled_ || socket_ == INVALID_SOCKET) return;
+-        for (;;) {
++        for (unsigned drained = 0; drained < 128; ++drained) {
+             uint8_t datagram[kHeaderBytes + kMaxFrameBytes];
+-            sockaddr_in from{};
+-            int from_len = sizeof(from);
+-            const int got = ::recvfrom(
+-                socket_, reinterpret_cast<char*>(datagram), sizeof(datagram),
+-                0, reinterpret_cast<sockaddr*>(&from), &from_len);
++            const int got = ::recvfrom(socket_, reinterpret_cast<char*>(datagram),
++                                       sizeof(datagram), 0, nullptr, nullptr);
+             if (got == SOCKET_ERROR) {
+                 const int err = WSAGetLastError();
++                if (err == WSAEMSGSIZE) continue;
+                 if (err != WSAEWOULDBLOCK && err != WSAECONNRESET) {
+                     melonDS::Platform::Log(melonDS::Platform::Warn,
+-                        "[local_mp] recvfrom failed: %d\n", err);
++                        "[local_mp] recv failed: %d\n", err);
+                 }
+                 return;
+             }
+@@ -1081,8 +1119,9 @@
+             frame.timestamp = ReadLe64(datagram + 16u);
+             if (frame.sender == instance_) continue;
+             if (frame.sender >= kMaxInstances) continue;
+-            if (len > kMaxFrameBytes) continue;
+-            if (kHeaderBytes + len != static_cast<uint32_t>(got)) continue;
++            if (peer_ipv4_ && frame.sender != (instance_ ^ 1u)) continue;
++            if (len != static_cast<uint32_t>(got) - kHeaderBytes) continue;
++            if (!IsValidFrame(frame.type, datagram + kHeaderBytes, len)) continue;
+             frame.payload.assign(datagram + kHeaderBytes,
+                                  datagram + kHeaderBytes + len);
+ 
+@@ -1120,6 +1159,8 @@
+     bool enabled_ = false;
+     uint32_t instance_ = 0;
+     uint16_t base_port_ = 26710;
++    uint32_t bind_ipv4_ = 0;
++    uint32_t peer_ipv4_ = 0;
+     LocalMpFrameQueue packet_queue_{kQueueCapacity};
+     LocalMpFrameQueue reply_queue_{kQueueCapacity};
+     int last_host_id_ = -1;
+@@ -1806,7 +1847,9 @@
+     g_bridge->local_mp.Configure(
+         g_network_config.local_wireless_enabled,
+         g_network_config.local_wireless_instance,
+-        g_network_config.local_wireless_base_port);
++        g_network_config.local_wireless_base_port,
++        g_network_config.local_wireless_bind_ipv4,
++        g_network_config.local_wireless_peer_ipv4);
+     g_bridge->local_wfc_peer.Configure(
+         g_network_config.slirp_virtual_network_instance);
+     if (g_network_config.local_wireless_enabled) {
+--- a/runner/vendor/melonds/Wifi.cpp
++++ b/runner/vendor/melonds/Wifi.cpp
+@@ -818,7 +818,7 @@
+ 
+ void Wifi::SendMPDefaultReply()
+ {
+-    u8 reply[12 + 28];
++    u8 reply[12 + 28]{};
+ 
+     *(u16*)&reply[0xA] = 28; // length
+ 
+@@ -912,7 +912,7 @@
+ 
+ void Wifi::SendMPAck(u16 cmdcount, u16 clientfail)
+ {
+-    u8 ack[12 + 32];
++    u8 ack[12 + 32]{};
+ 
+     *(u16*)&ack[0xA] = 32; // length
+ 
+diff --git a/runner/src/tier3.cpp b/runner/src/tier3.cpp
+--- a/runner/src/tier3.cpp
++++ b/runner/src/tier3.cpp
+@@ -25,6 +25,8 @@
+ #include "coverage_manifest.h"
+ #include "live_overlay.h"
+ #include "emu_profile.h"
++#include "sonic_jump_input.h"
++#include "sonic_pc_settings.h"
+ 
+ using armv4t::CPUState;
+ using armv4t::Interpreter;
+@@ -430,9 +432,15 @@
+         // is applied below only when the instruction does not branch.
+         const uint32_t code_correction = runtime_code_cycles(pc & ~1u);
+ 
+-        Instr in = thumb
+-            ? armv4t::ThumbDecoder::decode(g_bus.read16(pc & ~1u), pc & ~1u)
+-            : armv4t::ArmDecoder::decode(g_bus.read32(pc & ~3u), pc & ~3u);
++        Instr in;
++        if (thumb) {
++            in = armv4t::ThumbDecoder::decode(g_bus.read16(fetch_addr), fetch_addr);
++        } else {
++            uint32_t opcode = g_bus.read32(fetch_addr);
++            if (g_nds_active == NDS_ARM9 && !g_sonic_pc.trick_button_jumps)
++                opcode = sonic_jump_input_instruction(fetch_addr, opcode);
++            in = armv4t::ArmDecoder::decode(opcode, fetch_addr);
++        }
+         const bool condition_passed = Interpreter::cond_passes(in.cond, ic.cpsr);
+         const bool traced =
+             g_runtime_deep_trace &&

@@ -8,6 +8,7 @@
 #include <filesystem>
 #include <fstream>
 #include "toml.hpp"
+#include "frontend.h"
 #include "sonic_pc_settings.h"
 
 SonicPcPreferences sonic_pc_defaults() {
@@ -30,6 +31,15 @@ SonicPcPreferences sonic_pc_defaults() {
     return p;
 }
 SonicPcPreferences g_sonic_pc = sonic_pc_defaults();
+
+bool sonic_pc_battle_ipv4(const std::string& value, uint32_t* address) {
+    if (value.size() > 15) return false;
+    uint32_t parsed = 0;
+    if (!nds_parse_ipv4(value, &parsed) || (parsed >> 24) == 0 || (parsed >> 24) >= 224)
+        return false;
+    if (address) *address = parsed;
+    return true;
+}
 
 static bool valid_key(int value) {
     return value > SDL_SCANCODE_UNKNOWN && value < SDL_SCANCODE_COUNT &&
@@ -71,6 +81,14 @@ void sonic_pc_load(const std::string& path) {
         bounded("game_language",1,g_sonic_pc.game_language);
         bounded("aspect_mode",1,g_sonic_pc.aspect_mode);
         bounded("frame_rate",2,g_sonic_pc.frame_rate);
+        bounded("trick_button_jumps",1,g_sonic_pc.trick_button_jumps);
+        bounded("battle_role",2,g_sonic_pc.battle_role);
+        auto address = [&](const char* key) {
+            auto value = t[key].value_or(std::string{});
+            return sonic_pc_battle_ipv4(value) ? value : std::string{};
+        };
+        g_sonic_pc.battle_local_ip = address("battle_local_ip");
+        g_sonic_pc.battle_peer_ip = address("battle_peer_ip");
         unique_bindings(t["keys"].as_array(),g_sonic_pc.keys,valid_key);
         unique_bindings(t["buttons"].as_array(),g_sonic_pc.buttons,valid_button);
         unique_bindings(t["menu_keys"].as_array(),g_sonic_pc.menu_keys,valid_key);
@@ -96,7 +114,11 @@ bool sonic_pc_save(const std::string& path) {
                 << "\nmenu_language = " << g_sonic_pc.menu_language
                 << "\ngame_language = " << g_sonic_pc.game_language
                 << "\naspect_mode = " << g_sonic_pc.aspect_mode
-                << "\nframe_rate = " << g_sonic_pc.frame_rate << '\n';
+                << "\nframe_rate = " << g_sonic_pc.frame_rate
+                << "\ntrick_button_jumps = " << g_sonic_pc.trick_button_jumps
+                << "\nbattle_role = " << g_sonic_pc.battle_role
+                << "\nbattle_local_ip = \"" << g_sonic_pc.battle_local_ip << '"'
+                << "\nbattle_peer_ip = \"" << g_sonic_pc.battle_peer_ip << "\"\n";
             auto write_array = [&](const char* name,const auto& values) {
                 out << name << " = [";
                 for (size_t i=0;i<values.size();++i) { if(i)out<<", ";out<<values[i]; }
