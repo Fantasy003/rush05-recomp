@@ -86,6 +86,51 @@ def extract_cpu_inputs(rom, nds, images):
         (images / f"freebios{cpu}.bin").write_bytes(bytes(int(value, 16) for value in values))
 
 
+def extract_arm9_overlay_zero(rom, output):
+    # The supported ROM stores overlay 0 uncompressed in its NitroFS FAT.
+    fat_offset, fat_size, table_offset, table_size = struct.unpack_from("<4I", rom, 0x48)
+    if (fat_offset + fat_size > len(rom) or table_offset + table_size > len(rom)
+            or table_size % 32):
+        raise ValueError("ARM9 overlay table or FAT is out of range")
+    records = struct.iter_unpack("<8I", memoryview(rom)[table_offset:table_offset + table_size])
+    for overlay_id, _, size, _, _, _, file_id, flags in records:
+        if overlay_id != 0:
+            continue
+        fat_entry = file_id * 8
+        if fat_entry + 8 > fat_size or flags & 0x01000000:
+            raise ValueError("Expected an uncompressed ARM9 overlay 0")
+        start, end = struct.unpack_from("<2I", rom, fat_offset + fat_entry)
+        if end > len(rom) or end - start != size:
+            raise ValueError("ARM9 overlay 0 payload is out of range")
+        output.write_bytes(rom[start:end])
+        return
+    raise ValueError("ARM9 overlay 0 is missing")
+
+
+def patch_recompiled_ground_jump_checks(title_banks):
+    # The interpreter already filters these exact ROM instructions. Apply
+    # the same mask before the generated code updates the guest flags.
+    header = (PROJECT / "src/sonic_jump_input.h").read_text(encoding="utf-8")
+    addresses = re.findall(r"case 0x([0-9a-fA-F]{8})u:", header)
+    for body in sorted(title_banks.glob("sonic_arm9_*_[0-9][0-9].c")):
+        source = body.read_text(encoding="utf-8")
+        updated = source
+        for address in addresses:
+            pc = address.upper()
+            if f"/* {pc}  {address.lower()} A ands r0,r0,#0x3 */" not in source:
+                continue
+            instruction = f"_r_{pc} = _rn_{pc} & 0x00000003u;"
+            if instruction not in updated:
+                raise ValueError(f"Unexpected ground jump code emitted at {pc} in {body.name}")
+            updated = updated.replace(
+                instruction, f"_r_{pc} = _rn_{pc} & sonic_ground_jump_button_mask();")
+        if updated != source:
+            updated = updated.replace(
+                '#include "runtime_arm.h"\n',
+                '#include "runtime_arm.h"\nextern uint32_t sonic_ground_jump_button_mask(void);\n', 1)
+            body.write_text(updated, encoding="utf-8", newline="\n")
+
+
 def build(options):
     if os.name != "nt":
         raise ValueError("This build script targets Windows x64")
@@ -123,9 +168,17 @@ def build(options):
     ui = workspace / "ui"
     sdl = workspace / "sdl/x86_64-w64-mingw32"
     apply_patches(nds, ui)
+    if options.experimental_arm7_coverage:
+        entries = (PROJECT / "config/arm7-runtime-entries.toml").read_text(encoding="utf-8")
+        arm7 = workspace / "arm7-runtime.toml"
+        upstream = configs[7].read_text(encoding="utf-8")
+        arm7.write_text(upstream.rstrip() + "\n\n" + entries, encoding="utf-8")
+        configs[7] = arm7
     images = workspace / "images"
     images.mkdir()
     extract_cpu_inputs(rom, nds, images)
+    if options.experimental_arm9_coverage:
+        extract_arm9_overlay_zero(rom, images / "arm9-overlay0.bin")
     del rom
 
     cmake_options = [
@@ -134,8 +187,8 @@ def build(options):
         f"-DNDSRECOMP_TOMLPP_HEADER={options.toml_header.resolve()}",
     ]
 
-    def run(*command):
-        subprocess.run(command, check=True, env=env, cwd=workspace)
+    def run(*command, extra_env=None):
+        subprocess.run(command, check=True, env=env | (extra_env or {}), cwd=workspace)
 
     def compile_target(directory, target):
         run(str(cmake), "--build", str(directory), "--target", target, "-j", str(options.jobs))
@@ -169,6 +222,20 @@ def build(options):
             f'const NdsDispatchEntry g_dispatch_arm{cpu}_bios[1] = {{ {{0}} }};\n'
             f'const unsigned g_dispatch_arm{cpu}_bios_len = 0;\n', encoding="utf-8")
 
+    if options.experimental_arm9_coverage:
+        # Keep existing main-bank entries ahead of overlapping checked entries.
+        (title_banks / "registration-order.txt").write_text("sonic_arm9_main\n", encoding="utf-8")
+        for region, image, shards in (("main", "arm9.bin", 4), ("overlay", "arm9-overlay0.bin", 8)):
+            bank = f"sonic_arm9_{region}_coverage"
+            run(str(recompile), "--config", str(PROJECT / "config" / f"arm9-{region}-coverage.toml"),
+                "--bin", str(images / image), "--out", str(title_banks), "--bank", bank,
+                "--shards", str(shards), "--validate-live-bytes",
+                extra_env={"NDSRECOMP_NO_RELOC_SCAN": "1"})
+            if not (title_banks / f"{bank}_dispatch.c").is_file():
+                raise ValueError(f"Recompiler failed to produce {bank}")
+
+    patch_recompiled_ground_jump_checks(title_banks)
+
     runner_build = workspace / "runner-build"
     run(str(cmake), "-S", str(nds / "runner"), "-B", str(runner_build), *cmake_options,
         "-DNDS_BOOTSTRAP_FIRMWARE=ON", "-DNDS_ENABLE_COMPUTE_RENDERER=ON",
@@ -194,6 +261,10 @@ def main():
     parser.add_argument("--toolchain", type=Path, required=True)
     parser.add_argument("--work-dir", type=Path, default=PROJECT / "build")
     parser.add_argument("--jobs", type=int, default=2)
+    parser.add_argument("--experimental-arm7-coverage", action="store_true",
+                        help="Compile additional ROM-matched ARM7 code after boot relocation")
+    parser.add_argument("--experimental-arm9-coverage", action="store_true",
+                        help="Compile additional ARM9 startup and gameplay code with runtime byte checks")
     args = parser.parse_args()
     try:
         build(args)

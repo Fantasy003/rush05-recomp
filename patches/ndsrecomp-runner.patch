@@ -2693,7 +2693,15 @@
 diff --git a/runner/src/tier3.cpp b/runner/src/tier3.cpp
 --- a/runner/src/tier3.cpp
 +++ b/runner/src/tier3.cpp
-@@ -25,6 +25,8 @@
+@@ -9,6 +9,7 @@
+ 
+ #include <algorithm>
+ #include <cstdio>
++#include <cstdlib>
+ #include <unordered_map>
+ #include <vector>
+ 
+@@ -25,6 +26,8 @@
  #include "coverage_manifest.h"
  #include "live_overlay.h"
  #include "emu_profile.h"
@@ -2702,7 +2710,39 @@ diff --git a/runner/src/tier3.cpp b/runner/src/tier3.cpp
  
  using armv4t::CPUState;
  using armv4t::Interpreter;
-@@ -430,9 +432,15 @@
+@@ -233,6 +236,22 @@
+ 
+ void tier3_run(uint32_t /*entry*/) {
+     const uint32_t cpu_index = g_nds_active == NDS_ARM7 ? 1u : 0u;
++    const bool entry_thumb = (g_cpu.cpsr & CPSR_T_BIT) != 0u;
++    const uint32_t entry_pc = g_cpu.R[15] & ~1u;
++    // Audit recompiled CPU coverage independently of the device models.
++    static const bool require_recompiled = [] {
++        const char* value = std::getenv("NDS_REQUIRE_RECOMPILED_CPU");
++        return value && value[0] == '1' && value[1] == '\0';
++    }();
++    if (require_recompiled) {
++        std::fprintf(stderr,
++                     "[recompiled-cpu] interpreter required: "
++                     "cpu=%s pc=0x%08X mode=%s lr=0x%08X\n",
++                     cpu_index == 0 ? "arm9" : "arm7", entry_pc,
++                     entry_thumb ? "thumb" : "arm", g_cpu.R[14]);
++        std::_Exit(EXIT_FAILURE);
++    }
++
+     // TIER-3 INTERPRETER, carved exclusively out of NDS_EMU_EXEC_*. Before
+     // this the interpreter had instruction and entry COUNTS but no host-time
+     // measurement at all, so "is this title slow because of Tier 3" could only
+@@ -255,8 +274,6 @@
+     // filing below: commissioning the compiler for a page whose shard is
+     // already sitting in the cache, unactivated, is what kept a fresh install
+     // recompiling the same pages run after run.
+-    const bool entry_thumb = (g_cpu.cpsr & CPSR_T_BIT) != 0u;
+-    const uint32_t entry_pc = g_cpu.R[15] & ~1u;
+     const bool entry_dormant =
+         live_overlay_note_tier3_entry(g_nds_active, entry_pc);
+     // Both withholding rules in one place (dispatch_lookup.h). The second
+@@ -430,9 +447,15 @@
          // is applied below only when the instruction does not branch.
          const uint32_t code_correction = runtime_code_cycles(pc & ~1u);
  
@@ -3514,3 +3554,13 @@ diff --git a/runner/src/tier3.cpp b/runner/src/tier3.cpp
      {
          uvec4 color8;
          color8.x = bitfieldExtract(color.x, 0, 8);
+--- a/runner/tests/gpu2d_window_test.cpp
++++ b/runner/tests/gpu2d_window_test.cpp
+@@ -778,6 +778,7 @@
+ uint16_t nds_gpu3d_render_xpos() { return g_3d_render_xpos; }
+ uint32_t nds_gpu3d_render_polygon_count() { return g_3d_render_polygon_count; }
+ bool nds_gpu3d_display_readback_latency() { return false; }
++bool nds_gpu3d_pc_raster_line_ready() { return false; }
+ bool nds_gpu3d_projection_has_perspective() {
+     return g_3d_projection_has_perspective;
+ }

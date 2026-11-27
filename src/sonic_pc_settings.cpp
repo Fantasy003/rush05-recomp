@@ -32,6 +32,11 @@ SonicPcPreferences sonic_pc_defaults() {
 }
 SonicPcPreferences g_sonic_pc = sonic_pc_defaults();
 
+// Called by the recompiled ARM9 ground-jump checks.
+extern "C" uint32_t sonic_ground_jump_button_mask() {
+    return g_sonic_pc.trick_button_jumps ? 3u : 1u;
+}
+
 bool sonic_pc_battle_ipv4(const std::string& value, uint32_t* address) {
     if (value.size() > 15) return false;
     uint32_t parsed = 0;
