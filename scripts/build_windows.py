@@ -171,7 +171,7 @@ def build(options):
 
     runner_build = workspace / "runner-build"
     run(str(cmake), "-S", str(nds / "runner"), "-B", str(runner_build), *cmake_options,
-        "-DNDS_BOOTSTRAP_FIRMWARE=ON", "-DNDS_ENABLE_COMPUTE_RENDERER=OFF",
+        "-DNDS_BOOTSTRAP_FIRMWARE=ON", "-DNDS_ENABLE_COMPUTE_RENDERER=ON",
         "-DNDS_SDL_BACKEND=SDL3", f"-DSDL3_DIR={sdl / 'lib/cmake/SDL3'}",
         f"-DNDS_RECOMP_UI_ROOT={ui}", f"-DNDS_TITLE_BANK_DIR={title_banks}",
         f"-DNDS_TITLE_ROM_SHA1={ROM_SHA1}", "-DNDS_TITLE_VERSION=rush05-recomp")

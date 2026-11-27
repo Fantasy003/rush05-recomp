@@ -13,12 +13,15 @@ struct SonicPcPreferences {
     int screen_mode = 0;   // 0 NDS, 1 Concentrado
     int window_mode = 0;   // 0 windowed, 1 exclusive, 2 borderless
     int resolution = 0;
+    int internal_resolution = 0;
     int filter = 0;
     int border = 0;        // 0 original, 1 black, 2 graphite frame
     int menu_language = 1; // 0 English, 1 Spanish
     int game_language = 0;
     int aspect_mode = 0;   // 0 stacked, 1 choose layout to fit the display
     int frame_rate = 1;    // 0 = 30, 1 = native (~60), 2 = blended up to ~120
+    int dual_monitors = 0;
+    int dual_monitors_inverted = 0;
     int trick_button_jumps = 1;
     int battle_role = 0;   // 0 offline, 1 host, 2 join
     std::string battle_local_ip;
@@ -27,6 +30,9 @@ struct SonicPcPreferences {
     std::array<int,12> buttons{};
     std::array<int,kSonicMenuActionCount> menu_keys{};
     std::array<int,kSonicMenuActionCount> menu_buttons{};
+};
+inline constexpr std::array<uint16_t, 8> kSonicRasterHeights{
+    192, 240, 480, 560, 720, 1080, 1440, 2160
 };
 extern SonicPcPreferences g_sonic_pc;
 SonicPcPreferences sonic_pc_defaults();

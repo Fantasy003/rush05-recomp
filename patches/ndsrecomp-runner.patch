@@ -53,8 +53,7 @@
 +bool nds_apply_user_language(std::vector<uint8_t>& fw, unsigned language);
 --- a/runner/src/frontend.cpp
 +++ b/runner/src/frontend.cpp
-@@ -1,4 +1,11 @@
-+// Modified for rush05-recomp by ChatGPT in 2026. See NOTICE.md for scope.
+@@ -1,4 +1,10 @@
  #include "frontend.h"
 +#include "sonic_pc_settings.h"
 +#include "sonic_scale2x.h"
@@ -65,7 +64,7 @@
  #include "host_profile.h"
  
  #include <algorithm>
-@@ -269,6 +276,15 @@
+@@ -269,6 +275,15 @@
  
  constexpr int kScreenWidth = 256;
  constexpr int kScreenHeight = 192;
@@ -81,7 +80,7 @@
  
  enum class MphPrimeInputKind : uint8_t {
      None,
-@@ -866,43 +882,8 @@
+@@ -866,43 +881,8 @@
  #endif
  }
  
@@ -127,7 +126,7 @@
  
  SDL_GameController* open_first_controller() {
  #if defined(NDS_HAVE_SDL3)
-@@ -936,10 +917,12 @@
+@@ -936,10 +916,12 @@
  void set_touch_from_mouse(float x, float y, bool down,
                            NdsScreenLayout layout, int logical_width) {
      // Coordinates are expected in the renderer's logical DS-space.
@@ -144,7 +143,33 @@
      if (!down || x < left || x >= left + kScreenWidth ||
          y < bottom_origin || y >= bottom_origin + kScreenHeight) {
          nds_set_touch(0, 0, false);
-@@ -1128,175 +1111,37 @@
+@@ -968,7 +950,8 @@
+ }
+ 
+ uint32_t drain_audio(const NdsAudioDevice& device, AudioQueue& queue,
+-                     bool throttle, uint32_t pace_floor, bool& queue_error) {
++                     bool throttle, uint32_t pace_floor, bool& queue_error,
++                     void (*wait_pump)(void*) = nullptr, void* wait_context = nullptr) {
+     if (!device) return 0;
+     std::array<int16_t, 2048> samples{};
+     for (;;) {
+@@ -1010,6 +993,7 @@
+                     queue_error = true;
+                     return audio_queue_count(device, queue);
+                 }
++                if (wait_pump) wait_pump(wait_context);
+                 SDL_Delay(1);
+             }
+         }
+@@ -1024,6 +1008,7 @@
+     // buffered runway instead of having it slept away.
+     uint32_t queued = audio_queue_count(device, queue);
+     while (throttle && queued > pace_floor) {
++        if (wait_pump) wait_pump(wait_context);
+         SDL_Delay(1);
+         queued = audio_queue_count(device, queue);
+     }
+@@ -1128,175 +1113,37 @@
      return hash;
  }
  
@@ -345,7 +370,66 @@
  }
  
  const uint32_t* runtime_menu_overlay(RecompRuntimeUi* ui,
-@@ -1328,6 +1173,12 @@
+@@ -1315,6 +1162,41 @@
+         ui, surface.data(), width, height, width * sizeof(uint32_t));
+     return surface.data();
+ }
++
++// Sparse native LCD samples reject double images around moving objects
++// without reading the full high-resolution frame back again.
++struct SonicMotionRegion {
++    static constexpr int columns = 16;
++    static constexpr int rows = 12;
++    static constexpr int samples = 16;
++    SonicScreenRect rect{};
++    std::array<uint32_t, columns * rows * samples> pixels{};
++};
++
++struct SonicWindowFrameHistory {
++    SDL_Texture* images[4]{};
++    std::array<std::array<SonicMotionRegion, 2>, 4> motion{};
++    std::array<int, 4> geometry{};
++    int shown = -1;
++    int queued = -1;
++    int following = -1;
++    int write = 0;
++    bool queued_blended = false;
++
++    void reset() {
++        shown = queued = following = -1;
++        write = 0;
++        queued_blended = false;
++    }
++    void clear() {
++        for (auto*& image : images) {
++            if (image) SDL_DestroyTexture(image);
++            image = nullptr;
++        }
++        geometry = {};
++        reset();
++    }
++};
+ 
+ struct FrontendPresentation {
+     bool separate = false;
+@@ -1324,10 +1206,36 @@
+     SDL_Texture* textures[2]{};
+     SDL_Texture* sample_targets[2]{};
+     uint32_t window_ids[2]{};
++    std::array<int, 2> monitor_lcds{0, 1};
++    bool secondary_black = false;
++    SonicWindowFrameHistory history[2];
++    uint64_t history_due_ns = 0;
++    uint64_t history_interval_ns = 0;
++    bool history_blends = false;
++    bool history_blend_next = false;
++    bool history_blend_secondary = false;
++
++    uint32_t touch_window_id() const {
++        if (!separate || monitor_lcds[1] == 1) return window_ids[1];
++        return monitor_lcds[0] == 1 ? window_ids[0] : 0;
++    }
+     int screen_widths[2]{kScreenWidth, kScreenWidth};
      int canvas_width = kScreenWidth;
      int configured_sample_scale = 1;
      int sample_scale = 1;
@@ -354,14 +438,35 @@
 +    bool sonic_fills_output = false;
 +    SDL_Texture* edge_textures[2]{};
 +    bool edge_ready[2]{};
++    SDL_Texture* raster_textures[2]{};
++    std::array<std::array<int, 2>, 2> raster_sizes{};
++    bool raster_ready[2]{};
++    bool raster_failure_logged = false;
++    bool raster_success_logged = false;
++    int pc_raster_preset = 0;
++    uint8_t pc_governor_stage = 0;
 +    std::vector<uint32_t> edge_pixels;
  };
  
  // docs/frame_interpolation.md, MVP blend mode. Holds the previous DS frame's
-@@ -1381,6 +1232,10 @@
+@@ -1338,7 +1246,7 @@
+     std::vector<uint32_t> previous[2];
+     std::vector<uint32_t> blended[2];
+     int widths[2]{0, 0};
+-    bool valid = false;
++    unsigned lcd_mask = 0;
+ };
+ 
+ // 50/50 per-channel average, the alpha 0.5 midpoint the 120 Hz target wants.
+@@ -1381,6 +1289,15 @@
  #endif
  
  void destroy_presentation(FrontendPresentation& presentation) {
++    for (auto& history : presentation.history) history.clear();
++    for (auto*& texture : presentation.raster_textures) {
++        if (texture) SDL_DestroyTexture(texture);
++        texture = nullptr;
++    }
 +    for (auto*& texture : presentation.edge_textures) {
 +        if (texture) SDL_DestroyTexture(texture);
 +        texture = nullptr;
@@ -369,7 +474,7 @@
      for (SDL_Texture*& texture : presentation.sample_targets) {
          if (texture) SDL_DestroyTexture(texture);
          texture = nullptr;
-@@ -1467,16 +1322,46 @@
+@@ -1467,16 +1384,46 @@
  
  bool set_window_fullscreen(SDL_Window* window, NdsFullscreenMode mode) {
  #if defined(NDS_HAVE_SDL3)
@@ -419,27 +524,27 @@
  #else
      return SDL_RenderSetLogicalSize(renderer, width, height) == 0;
  #endif
-@@ -1725,8 +1610,8 @@
+@@ -1725,8 +1672,8 @@
          (presentation.gl_top
               ? static_cast<uint64_t>(SDL_WINDOW_OPENGL) : 0u);
      presentation.windows[0] = create_window(
 -        presentation.separate ? "ndsrecomp - Top Screen"
 -                               : "ndsrecomp firmware preview",
-+        presentation.separate ? "Sonic Rush - Top Screen"
++        presentation.separate ? "Sonic Rush - Primary Display"
 +                               : "Sonic Rush",
          SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED,
          (presentation.separate ? presentation.screen_widths[0]
                                 : presentation.canvas_width) * kWindowScale,
-@@ -1750,7 +1635,7 @@
+@@ -1750,7 +1697,7 @@
          int top_y = 0;
          SDL_GetWindowPosition(presentation.windows[0], &top_x, &top_y);
          presentation.windows[1] = create_window(
 -            "ndsrecomp - Bottom Screen",
-+            "Sonic Rush - Bottom Screen",
++            "Sonic Rush - Secondary Display",
              top_x + presentation.screen_widths[0] * kWindowScale + 32,
              top_y,
              presentation.screen_widths[1] * kWindowScale,
-@@ -1853,10 +1738,13 @@
+@@ -1853,10 +1800,17 @@
      return true;
  }
  
@@ -449,34 +554,451 @@
                     const SDL_Rect& destination) {
      SDL_Renderer* renderer = presentation.renderers[screen];
 -    SDL_Texture* source = presentation.textures[screen];
++    if (presentation.raster_ready[screen]) {
++        render_texture(renderer, presentation.raster_textures[screen], &destination);
++        return;
++    }
 +    SDL_Texture* source = presentation.edge_ready[screen]
 +        ? presentation.edge_textures[screen] : presentation.textures[screen];
      if (presentation.sample_scale > 1 && presentation.sample_targets[screen]) {
          SDL_SetRenderTarget(renderer, presentation.sample_targets[screen]);
          SDL_SetRenderDrawColor(renderer, 0, 0, 0, 255);
-@@ -1963,33 +1851,80 @@
+@@ -1873,6 +1827,9 @@
+     uint64_t draw = 0;
+     uint64_t swap = 0;
+     bool ok = true;
++    unsigned native_presents = 0;
++    unsigned blended_presents = 0;
++    unsigned repeated_presents = 0;
+ };
+ 
+ // All-or-nothing. The only fallible step is the renderer rebuild, so it runs
+@@ -1886,12 +1843,25 @@
+         uint8_t stage) {
+     const uint8_t target_scale =
+         stage >= 2u ? 1u : options.internal_resolution;
+-    if (!nds_gpu3d_set_runtime_internal_scale(target_scale)) {
++    if (g_sonic_pc.internal_resolution && presentation.pc_raster_preset) {
++        constexpr int preset_720p = 4;
++        const int wanted = stage >= 2u
++            ? std::min(g_sonic_pc.internal_resolution, preset_720p)
++            : g_sonic_pc.internal_resolution;
++        if (wanted != presentation.pc_raster_preset) {
++            if (!sonic_apply_internal_resolution(wanted, presentation.pc_raster_preset))
++                return false;
++            presentation.pc_raster_preset = wanted;
++            presentation.raster_success_logged = false;
++            presentation.raster_failure_logged = false;
++        }
++    } else if (!nds_gpu3d_set_runtime_internal_scale(target_scale)) {
+         std::fprintf(stderr,
+                      "[governor] could not apply internal scale %u\n",
+                      static_cast<unsigned>(target_scale));
+         return false;
+     }
++    presentation.pc_governor_stage = stage;
+     nds_gpu3d_set_display_readback_latency(stage >= 1u);
+     presentation.sample_scale =
+         stage >= 2u ? 1 : presentation.configured_sample_scale;
+@@ -1913,7 +1883,360 @@
+     render_line(renderer, x, y + 2, x, y + 5);
+ }
+ 
++void wait_for_presentation(uint64_t deadline_ns) {
++    if (!deadline_ns) return;
++    const uint64_t now_ns = SDL_GetTicksNS();
++    if (deadline_ns > now_ns) SDL_DelayPrecise(deadline_ns - now_ns);
++}
++
++// Opt-in diagnostic timestamps for successful primary-display submissions.
++enum class SonicPresentType { Native, Blended, Repeated };
++struct SonicPresentSample {
++    uint64_t deadline;
++    uint64_t start;
++    uint64_t finish;
++    SonicPresentType type;
++};
++
++const char* sonic_present_trace_path = nullptr;
++std::array<SonicPresentSample, 8192> sonic_present_samples{};
++size_t sonic_present_sample_count = 0;
++bool sonic_present_trace_gameplay = false;
++
++bool sonic_present(SDL_Renderer* renderer, int window, uint64_t deadline_ns,
++                   SonicPresentType type) {
++    const bool trace = sonic_present_trace_path && sonic_present_trace_gameplay && window == 0;
++    const uint64_t start = trace ? SDL_GetTicksNS() : 0;
++#if defined(NDS_HAVE_SDL3)
++    const bool presented = SDL_RenderPresent(renderer);
++#else
++    SDL_RenderPresent(renderer);
++    const bool presented = true;
++#endif
++    if (trace && presented) {
++        sonic_present_samples[sonic_present_sample_count++ % sonic_present_samples.size()] =
++            {deadline_ns, start, SDL_GetTicksNS(), type};
++    }
++    return presented;
++}
++
++void sonic_write_present_trace() {
++    if (!sonic_present_trace_path) return;
++    FILE* file = std::fopen(sonic_present_trace_path, "w");
++    if (!file) return;
++    std::fputs("deadline_ns,submit_start_ns,submit_end_ns,type\n", file);
++    const size_t count = std::min(sonic_present_sample_count, sonic_present_samples.size());
++    for (size_t i = sonic_present_sample_count - count; i < sonic_present_sample_count; ++i) {
++        const auto& sample = sonic_present_samples[i % sonic_present_samples.size()];
++        std::fprintf(file, "%llu,%llu,%llu,%d\n",
++            static_cast<unsigned long long>(sample.deadline),
++            static_cast<unsigned long long>(sample.start),
++            static_cast<unsigned long long>(sample.finish),
++            static_cast<int>(sample.type));
++    }
++    std::fclose(file);
++}
++
++// At 120 Hz, hold one completed frame so the midpoint is already available
++// while the next guest frame is being emulated. Textures stay on the SDL GPU.
++void sonic_reset_history(FrontendPresentation& p) {
++    for (auto& history : p.history) history.reset();
++    p.history_due_ns = 0;
++}
++
++bool sonic_begin_history(FrontendPresentation& p, int window,
++                         const SonicScreenLayout& layout) {
++#if defined(NDS_HAVE_SDL3)
++    auto* renderer = p.renderers[window];
++    auto& history = p.history[window];
++    SDL_FRect viewport{};
++    if (!SDL_GetRenderLogicalPresentationRect(renderer, &viewport) ||
++        viewport.w < 1 || viewport.h < 1) {
++        history.reset();
++        return false;
++    }
++    const int width = static_cast<int>(std::ceil(viewport.w));
++    const int height = static_cast<int>(std::ceil(viewport.h));
++    const std::array geometry{width, height, layout.width, layout.height};
++    if (history.geometry != geometry) {
++        if (history.geometry[0] != width || history.geometry[1] != height) {
++            history.clear();
++            for (auto*& image : history.images) {
++                image = SDL_CreateTexture(renderer, SDL_PIXELFORMAT_ARGB8888,
++                                          SDL_TEXTUREACCESS_TARGET, width, height);
++                if (!image) {
++                    history.clear();
++                    return false;
++                }
++                SDL_SetTextureScaleMode(image, SDL_SCALEMODE_NEAREST);
++                SDL_SetTextureBlendMode(image, SDL_BLENDMODE_NONE);
++            }
++        }
++        history.geometry = geometry;
++        history.reset();
++    }
++    if (SDL_SetRenderTarget(renderer, history.images[history.write]) &&
++        set_render_logical_size(renderer, layout.width, layout.height, true))
++        return true;
++    SDL_SetRenderTarget(renderer, nullptr);
++    history.reset();
++#else
++    (void)p;
++    (void)window;
++    (void)layout;
++#endif
++    return false;
++}
++
++void sonic_sample_motion(SonicMotionRegion& region, const SonicScreenRect& rect,
++                         const uint32_t* pixels, int width) {
++    region.rect = rect;
++    if (!rect.w || !rect.h) return;
++    constexpr int step = 4;
++    size_t i = 0;
++    for (int row = 0; row < SonicMotionRegion::rows; ++row) {
++        for (int col = 0; col < SonicMotionRegion::columns; ++col) {
++            for (int y = 0; y < step; ++y) {
++                const int py = (2 * (row * step + y) + 1) * kScreenHeight /
++                               (2 * SonicMotionRegion::rows * step);
++                for (int x = 0; x < step; ++x) {
++                    const int px = (2 * (col * step + x) + 1) * width /
++                                   (2 * SonicMotionRegion::columns * step);
++                    region.pixels[i++] = pixels[py * width + px];
++                }
++            }
++        }
++    }
++}
++
++#if defined(NDS_HAVE_SDL3)
++bool sonic_blend_regions(SDL_Renderer* renderer, SDL_Texture* next,
++                         const SonicWindowFrameHistory& history, int frame, int blend) {
++    constexpr int cols = SonicMotionRegion::columns;
++    constexpr int rows = SonicMotionRegion::rows;
++    constexpr int samples = SonicMotionRegion::samples;
++    constexpr SDL_FColor alpha{1.f, 1.f, 1.f, 0.5f};
++    std::array<SDL_Vertex, 2 * rows * ((cols + 1) / 2) * 6> vertices;
++    size_t count = 0;
++    for (int region = 0; region < 2; ++region) {
++        const auto& old_image = history.motion[frame][region];
++        const auto& new_image = history.motion[blend][region];
++        const auto& a = old_image.rect;
++        const auto& b = new_image.rect;
++        if (!a.w || !b.w || a.x != b.x || a.y != b.y || a.w != b.w || a.h != b.h)
++            continue;
++        for (int row = 0; row < rows; ++row) {
++            auto stable = [&](int col) {
++                int changed = 0;
++                const size_t start = (row * cols + col) * samples;
++                for (int k = 0; k < samples; ++k) {
++                    const uint32_t old_pixel = old_image.pixels[start + k];
++                    const uint32_t new_pixel = new_image.pixels[start + k];
++                    int difference = 0;
++                    for (int shift = 0; shift <= 16; shift += 8)
++                        difference += std::abs(int((old_pixel >> shift) & 255u) -
++                                               int((new_pixel >> shift) & 255u));
++                    if (difference >= 72 && ++changed >= 2) return false;
++                }
++                return true;
++            };
++            for (int col = 0; col < cols;) {
++                if (!stable(col)) {
++                    ++col;
++                    continue;
++                }
++                const int run = col++;
++                while (col < cols && stable(col)) ++col;
++                float x0 = a.x + float(run * a.w) / cols;
++                float x1 = a.x + float(col * a.w) / cols;
++                float y0 = a.y + float(row * a.h) / rows;
++                float y1 = a.y + float((row + 1) * a.h) / rows;
++                auto corner = [&](float x, float y) {
++                    return SDL_Vertex{{x, y}, alpha, {x / history.geometry[2], y / history.geometry[3]}};
++                };
++                const auto tl = corner(x0, y0);
++                const auto tr = corner(x1, y0);
++                const auto bl = corner(x0, y1);
++                const auto br = corner(x1, y1);
++                vertices[count++] = tl; vertices[count++] = tr; vertices[count++] = bl;
++                vertices[count++] = tr; vertices[count++] = br; vertices[count++] = bl;
++            }
++        }
++    }
++    if (!count) return false;
++    SDL_SetTextureBlendMode(next, SDL_BLENDMODE_BLEND);
++    const bool drawn = SDL_RenderGeometry(renderer, next, vertices.data(),
++                                          static_cast<int>(count), nullptr, 0);
++    SDL_SetTextureBlendMode(next, SDL_BLENDMODE_NONE);
++    return drawn;
++}
++#endif
++
++bool sonic_draw_history(FrontendPresentation& p, int window, int frame, int blend = -1) {
++    auto* renderer = p.renderers[window];
++    const auto& history = p.history[window];
++    const SDL_Rect rect{0, 0, history.geometry[2], history.geometry[3]};
++    const uint8_t background = g_sonic_pc.border == 1 ? 0 : 20;
++    SDL_SetRenderDrawColor(renderer, background, background, background, 255);
++    SDL_RenderClear(renderer);
++    render_texture(renderer, history.images[frame], &rect);
++    if (blend >= 0) {
++        auto* next = history.images[blend];
++#if defined(NDS_HAVE_SDL3)
++        if (g_sonic_pc.internal_resolution)
++            return sonic_blend_regions(renderer, next, history, frame, blend);
++#endif
++        SDL_SetTextureAlphaMod(next, 128);
++        SDL_SetTextureBlendMode(next, SDL_BLENDMODE_BLEND);
++        render_texture(renderer, next, &rect);
++        SDL_SetTextureAlphaMod(next, 255);
++        SDL_SetTextureBlendMode(next, SDL_BLENDMODE_NONE);
++    }
++    return blend >= 0;
++}
++
++// Submit either display phase using only completed textures. A slow guest
++// frame can leave no new image for a slot, so hold the last complete image.
++bool sonic_service_history(FrontendPresentation& p, uint64_t cutoff_ns,
++                           bool wait, PresentationTicks& ticks) {
++    const uint64_t due = p.history_due_ns;
++    if (!due || due > cutoff_ns || p.history[0].shown < 0) return false;
++    if (!wait && SDL_GetTicksNS() < due) return false;
++    const uint64_t draw_start = SDL_GetPerformanceCounter();
++    auto type = SonicPresentType::Repeated;
++    unsigned windows = 0;
++    const int count = p.separate && (!p.history_blend_next || p.history_blend_secondary) ? 2 : 1;
++    for (int window = 0; window < count; ++window) {
++        auto& history = p.history[window];
++        if (history.shown < 0) continue;
++        auto window_type = SonicPresentType::Repeated;
++        int blend = -1;
++        if (history.queued >= 0) {
++            if (p.history_blend_next) {
++                blend = history.queued;
++                history.queued_blended = true;
++                window_type = SonicPresentType::Blended;
++            } else if (!p.history_blends || history.queued_blended ||
++                       (window && !p.history_blend_secondary)) {
++                // If the producer missed the previous midpoint, preserve the
++                // pair for the next one instead of repeatedly outrunning it.
++                history.shown = history.queued;
++                history.queued = history.following;
++                history.following = -1;
++                history.queued_blended = false;
++                window_type = SonicPresentType::Native;
++            }
++        }
++        const bool blended = sonic_draw_history(p, window, history.shown, blend);
++        if (blend >= 0 && !blended) window_type = SonicPresentType::Repeated;
++        if (!window) type = window_type;
++        windows |= 1u << window;
++    }
++    ticks.draw += SDL_GetPerformanceCounter() - draw_start;
++    wait_for_presentation(due);
++    const uint64_t swap_start = SDL_GetPerformanceCounter();
++    const uint64_t submitted = SDL_GetTicksNS();
++    for (int window = 0; window < count; ++window) {
++        if (!(windows & (1u << window))) continue;
++        if (sonic_present(p.renderers[window], window, due, type) && !window) {
++            switch (type) {
++            case SonicPresentType::Native: ++ticks.native_presents; break;
++            case SonicPresentType::Blended: ++ticks.blended_presents; break;
++            case SonicPresentType::Repeated: ++ticks.repeated_presents; break;
++            }
++        }
++    }
++    ticks.swap += SDL_GetPerformanceCounter() - swap_start;
++    // Preserve the cadence after a small overrun, without issuing a catch-up burst.
++    p.history_due_ns = std::max(due + p.history_interval_ns,
++                                submitted + p.history_interval_ns * 9 / 10);
++    p.history_blend_next = p.history_blends && !p.history_blend_next;
++#if defined(NDS_HAVE_COMPUTE_RENDERER)
++    nds_compute_host_make_current();
++#endif
++    return true;
++}
++
++struct SonicDisplayWaitPump {
++    explicit SonicDisplayWaitPump(FrontendPresentation& presentation) : presentation(presentation) {
++#if defined(NDS_HAVE_COMPUTE_RENDERER)
++        if (presentation.history_due_ns)
++            nds_compute_host_set_wait_pump(pump, this);
++#endif
++    }
++    ~SonicDisplayWaitPump() {
++#if defined(NDS_HAVE_COMPUTE_RENDERER)
++        nds_compute_host_set_wait_pump(nullptr, nullptr);
++#endif
++    }
++    static void pump(void* context) {
++        auto& state = *static_cast<SonicDisplayWaitPump*>(context);
++        constexpr uint64_t draw_ahead_ns = 750000;
++        const uint64_t cutoff = SDL_GetTicksNS() + draw_ahead_ns;
++        if (!state.presentation.history_due_ns || cutoff < state.presentation.history_due_ns) return;
++        const uint64_t start = SDL_GetPerformanceCounter();
++        if (sonic_service_history(state.presentation, cutoff, true, state.ticks))
++            state.elapsed += SDL_GetPerformanceCounter() - start;
++    }
++    FrontendPresentation& presentation;
++    PresentationTicks ticks{};
++    uint64_t elapsed = 0;
++};
++
++void sonic_enqueue_history(FrontendPresentation& p, unsigned windows,
++                           uint64_t deadline, uint64_t interval, bool blends,
++                           bool blend_secondary, PresentationTicks& ticks) {
++    // Allow emulation to refill the queue as soon as a frame is ready.
++    // Pace the producer by the actual queue depth, without a second timer.
++    p.history_blend_secondary = blend_secondary;
++    if (p.history_due_ns) {
++        while (p.history[0].following >= 0 &&
++               sonic_service_history(p, UINT64_MAX, true, ticks)) {}
++    }
++
++    for (int window = 0; window < 2; ++window) {
++        if (!(windows & (1u << window))) continue;
++        auto& history = p.history[window];
++        if (history.shown < 0) history.shown = history.write;
++        else if (history.queued < 0) history.queued = history.write;
++        else history.following = history.write;
++        history.write = 0;
++        while (history.write == history.shown || history.write == history.queued ||
++               history.write == history.following)
++            ++history.write;
++    }
++    if (!p.history_due_ns) {
++        // Keep two completed frames ahead before starting the display clock.
++        // A late producer frame usually spends that runway instead of
++        // repeating a displayed image.
++        if (p.history[0].following < 0) return;
++        const uint64_t start = SDL_GetPerformanceCounter();
++        for (int window = 0; window < 2; ++window) {
++            if (windows & (1u << window))
++                sonic_draw_history(p, window, p.history[window].shown);
++        }
++        ticks.draw += SDL_GetPerformanceCounter() - start;
++        const uint64_t swap = SDL_GetPerformanceCounter();
++        const uint64_t submitted = SDL_GetTicksNS();
++        for (int window = 0; window < 2; ++window) {
++            if (!(windows & (1u << window))) continue;
++            if (sonic_present(p.renderers[window], window, deadline, SonicPresentType::Native) && !window)
++                ++ticks.native_presents;
++        }
++        ticks.swap += SDL_GetPerformanceCounter() - swap;
++        p.history_interval_ns = interval;
++        p.history_due_ns = submitted + interval;
++        p.history_blends = blends;
++        p.history_blend_next = blends;
++    } else {
++        sonic_service_history(p, SDL_GetTicksNS(), false, ticks);
++    }
++}
++
+ PresentationTicks present_screens(FrontendPresentation& presentation,
++                                  const SonicFrameView& view,
++                                  uint64_t deadline_ns,
++                                  bool present_secondary,
+                                   const uint32_t* top_pixels,
+                                   int top_width,
+                                   const uint32_t* bottom_pixels,
+@@ -1922,12 +2245,16 @@
+                                   bool virtual_stylus_visible,
+                                   float virtual_stylus_x,
+                                   float virtual_stylus_y,
+-                                  const char* savestate_notice) {
++                                  const char* savestate_notice,
++                                  uint64_t history_interval_ns = 0,
++                                  bool history_blends = false,
++                                  bool history_blend_secondary = false) {
+     PresentationTicks ticks{};
+     if (presentation.gl_top) {
+ #if defined(NDS_HAVE_COMPUTE_RENDERER)
+         NdsGpu2dDirectFrame direct_frame{};
+         const bool direct = nds_gpu2d_direct_frame(&direct_frame);
++        wait_for_presentation(deadline_ns);
+         NdsComputePresentTicks gl_ticks{};
+         if (!nds_compute_host_present_top(
+                 top_pixels, static_cast<uint16_t>(top_width),
+@@ -1939,6 +2266,7 @@
+         ticks.upload += gl_ticks.upload;
+         ticks.draw += gl_ticks.draw;
+         ticks.swap += gl_ticks.swap;
++        ++ticks.native_presents;
+         bottom_pixels = runtime_menu_overlay(
+             runtime_ui, bottom_pixels, bottom_width, kScreenHeight);
+         uint64_t start = SDL_GetPerformanceCounter();
+@@ -1963,65 +2291,226 @@
  #endif
          return ticks;
      }
 -    top_pixels = runtime_menu_overlay(
 -        runtime_ui, top_pixels, top_width, kScreenHeight);
 +    g_sonic_main_screen=nds_gpu2d_presented_main_screen();
-+    const SonicScene scene = sonic_current_scene();
-+    g_sonic_player_active = scene == SonicScene::Gameplay;
++    g_sonic_player_active = view.player;
 +    const bool fit = g_sonic_pc.aspect_mode == 1;
 +    const bool menu_open = runtime_ui && recomp_runtime_ui_is_open(runtime_ui);
-+    // The DS pause flag is set while its own pause overlay is shown. That
-+    // overlay can still use the touchscreen even though stage tasks live on.
-+    const bool game_paused = fit && g_sonic_player_active &&
-+        (bus_debug_read8(9, 0x022c4ef0u) & 1u) != 0;
-+    const bool force_dual = fit && (menu_open || game_paused);
-+    const bool stack_screens = scene == SonicScene::Selection && !menu_open;
-+    // The stage-clear task draws its score and rank on engine A.
-+    // Use its LCD destination from the same published framebuffer.
-+    const bool focus_scene = g_sonic_player_active ||
-+        (fit && scene == SonicScene::Results);
-+    const int focus = sonic_pc_focus_screen(g_sonic_pc.screen_mode != 0,
-+        focus_scene && !force_dual, g_sonic_main_screen);
++    const bool stack_screens = view.stack_screens;
++    const int focus = view.focus;
 +    if(focus!=g_sonic_focus_screen){
 +        std::fprintf(stderr,"[sonic-pc] Focus %d (player=%u, main=%d)\n",focus,g_sonic_player_active?1u:0u,g_sonic_main_screen);
 +        nds_set_touch(0,0,false);
@@ -486,15 +1008,25 @@
 +        recomp_runtime_ui_set_status(runtime_ui, g_sonic_menu->capture_kind == 1
 +            ? sonic_text("Press a key. Esc cancels.","Pulsa una tecla. Esc cancela.")
 +            : sonic_text("Press a button. Esc cancels.","Pulsa un boton. Esc cancela."));
-+    if(focus==1)bottom_pixels=runtime_menu_overlay(runtime_ui,bottom_pixels,bottom_width,kScreenHeight);
-+    else top_pixels=runtime_menu_overlay(runtime_ui,top_pixels,top_width,kScreenHeight);
++    if (presentation.separate) {
++        const auto monitors = sonic_monitor_lcds(g_sonic_pc.dual_monitors_inverted, focus, view.boss_hud);
++        if (presentation.monitor_lcds != monitors) {
++            nds_set_touch(0, 0, false);
++            presentation.monitor_lcds = monitors;
++        }
++    }
++    const int overlay_lcd = presentation.separate ? presentation.monitor_lcds[0] : focus;
++    if (overlay_lcd == 1)
++        bottom_pixels = runtime_menu_overlay(runtime_ui, bottom_pixels, bottom_width, kScreenHeight);
++    else
++        top_pixels = runtime_menu_overlay(runtime_ui, top_pixels, top_width, kScreenHeight);
 +    int output_width = 0;
 +    int output_height = 0;
 +    if (!presentation.separate && focus < 0 && fit && !stack_screens)
 +        SDL_GetRenderOutputSize(presentation.renderers[0], &output_width, &output_height);
-+    const auto layout = sonic_screen_layout(output_width, output_height,
++    auto layout = sonic_screen_layout(output_width, output_height,
 +        presentation.screen_widths[0], presentation.screen_widths[1],
-+        kScreenHeight, sonic_frame_padding(), focus, fit && !stack_screens);
++        kScreenHeight, sonic_frame_padding(), focus, fit && !stack_screens, view.horizontal_screens);
 +    if (!presentation.separate && (presentation.sonic_logical_width != layout.width ||
 +                                  presentation.sonic_logical_height != layout.height ||
 +                                  presentation.sonic_fills_output != layout.fill_output)) {
@@ -509,20 +1041,61 @@
 +        presentation.sonic_logical_height = layout.height;
 +        presentation.sonic_fills_output = layout.fill_output;
 +    }
++    if (presentation.separate) {
++        if (presentation.sonic_fills_output != fit) {
++            for (auto* renderer : presentation.renderers) {
++                if (!set_render_logical_size(renderer, kScreenWidth, kScreenHeight, fit)) {
++                    std::fprintf(stderr, "[sonic-pc] Could not scale monitor: %s\n", SDL_GetError());
++                    ticks.ok = false;
++                    return ticks;
++                }
++            }
++            presentation.sonic_fills_output = fit;
++            presentation.secondary_black = false;
++            nds_set_touch(0, 0, false);
++        }
++        layout.width = kScreenWidth;
++        layout.height = kScreenHeight;
++        layout.fill_output = fit;
++        layout.lcd = {{{0, 0, kScreenWidth, kScreenHeight}, {0, 0, kScreenWidth, kScreenHeight}}};
++        if (focus >= 0 && !view.boss_hud) layout.lcd[1 - focus] = {};
++    }
 +    g_sonic_screen_layout = layout;
++    const bool use_history = history_interval_ns != 0;
++    if (use_history) {
++        // A readback can occupy the main thread. Give a nearby display slot
++        // its completed image before starting the next upload.
++        sonic_service_history(presentation, SDL_GetTicksNS() + 750000ull, true, ticks);
++    }
 +    const bool smooth_edges = g_sonic_pc.filter == 2 && !menu_open;
      uint64_t start = SDL_GetPerformanceCounter();
 -    SDL_UpdateTexture(presentation.textures[0], nullptr, top_pixels,
 -                      top_width * sizeof(uint32_t));
 -    SDL_UpdateTexture(presentation.textures[1], nullptr, bottom_pixels,
 -                      bottom_width * sizeof(uint32_t));
-+    if (focus != 1) sonic_upload_screen(presentation, 0, top_pixels, top_width, smooth_edges);
-+    if (focus != 0) sonic_upload_screen(presentation, 1, bottom_pixels, bottom_width, smooth_edges);
-     ticks.upload += SDL_GetPerformanceCounter() - start;
+-    ticks.upload += SDL_GetPerformanceCounter() - start;
      if (!presentation.separate) {
++        if (focus != 1) sonic_upload_screen(presentation, 0, 0, top_pixels, top_width, smooth_edges, !menu_open);
++        if (focus != 0) sonic_upload_screen(presentation, 1, 1, bottom_pixels, bottom_width, smooth_edges, !menu_open);
++        ticks.upload += SDL_GetPerformanceCounter() - start;
          SDL_Renderer* renderer = presentation.renderers[0];
          start = SDL_GetPerformanceCounter();
 -        SDL_SetRenderDrawColor(renderer, 20, 20, 20, 255);
++        const bool captured = use_history && sonic_begin_history(presentation, 0, layout);
++        if (!captured) presentation.history[0].reset();
++        if (captured && history_blends && g_sonic_pc.internal_resolution) {
++            auto& history = presentation.history[0];
++            auto& regions = history.motion[history.write];
++            // A focused LCD uses the same region even when the game changes LCDs.
++            if (focus >= 0) {
++                sonic_sample_motion(regions[0], layout.lcd[focus],
++                    focus == 0 ? top_pixels : bottom_pixels, focus == 0 ? top_width : bottom_width);
++                regions[1].rect = {};
++            } else {
++                sonic_sample_motion(regions[0], layout.lcd[0], top_pixels, top_width);
++                sonic_sample_motion(regions[1], layout.lcd[1], bottom_pixels, bottom_width);
++            }
++        }
 +        const uint8_t background = g_sonic_pc.border == 1 ? 0 : 20;
 +        SDL_SetRenderDrawColor(renderer, background, background, background, 255);
          SDL_RenderClear(renderer);
@@ -554,11 +1127,126 @@
 +        }
 +        draw_savestate_notice(renderer, focus == 0 ? top_rect : bottom_rect, savestate_notice);
          ticks.draw += SDL_GetPerformanceCounter() - start;
++        if (captured) {
++            SDL_SetRenderTarget(renderer, nullptr);
++            sonic_enqueue_history(presentation, 1, deadline_ns, history_interval_ns,
++                                  history_blends, false, ticks);
++        } else {
++            sonic_reset_history(presentation);
++            wait_for_presentation(deadline_ns);
++            start = SDL_GetPerformanceCounter();
++            if (sonic_present(renderer, 0, 0, SonicPresentType::Native)) ++ticks.native_presents;
++            ticks.swap += SDL_GetPerformanceCounter() - start;
++        }
++        return ticks;
++    }
++
++    const uint32_t* lcd_pixels[] = {top_pixels, bottom_pixels};
++    const int lcd_widths[] = {top_width, bottom_width};
++    const SDL_Rect screen_rect{0, 0, kScreenWidth, kScreenHeight};
++    unsigned present_monitors = 0;
++    unsigned captured_monitors = 0;
++#if defined(NDS_HAVE_SDL3)
++    bool clear_secondary_to_black = false;
++#endif
++    const int monitor_count = present_secondary ? 2 : 1;
++    for (int monitor = 0; monitor < monitor_count; ++monitor) {
++        const int lcd = presentation.monitor_lcds[monitor];
++        if (lcd < 0 || !use_history) presentation.history[monitor].reset();
++#if defined(NDS_HAVE_SDL3)
++        if (monitor == 1 && lcd < 0 && presentation.secondary_black) continue;
++#endif
++        if (lcd >= 0) {
++            start = SDL_GetPerformanceCounter();
++            sonic_upload_screen(presentation, monitor, lcd, lcd_pixels[lcd], lcd_widths[lcd], smooth_edges, !menu_open);
++            ticks.upload += SDL_GetPerformanceCounter() - start;
++        }
++        SDL_Renderer* renderer = presentation.renderers[monitor];
          start = SDL_GetPerformanceCounter();
-         SDL_RenderPresent(renderer);
-@@ -2022,6 +1957,12 @@
+-        SDL_RenderPresent(renderer);
+-        ticks.swap += SDL_GetPerformanceCounter() - start;
+-        return ticks;
+-    }
+-
+-    for (int screen = 0; screen < 2; ++screen) {
+-        const SDL_Rect screen_rect{
+-            0, 0, presentation.screen_widths[screen], kScreenHeight};
+-        SDL_Renderer* renderer = presentation.renderers[screen];
+-        start = SDL_GetPerformanceCounter();
+-        SDL_SetRenderDrawColor(renderer, 20, 20, 20, 255);
++        const bool captured = use_history && lcd >= 0 &&
++            (monitor == 0 || (captured_monitors & 1u)) &&
++            sonic_begin_history(presentation, monitor, layout);
++        if (!captured) presentation.history[monitor].reset();
++        if (captured && history_blends && g_sonic_pc.internal_resolution &&
++            (!monitor || history_blend_secondary)) {
++            auto& history = presentation.history[monitor];
++            sonic_sample_motion(history.motion[history.write][0], layout.lcd[lcd],
++                                lcd_pixels[lcd], lcd_widths[lcd]);
++        }
++        const uint8_t background = lcd < 0 || g_sonic_pc.border == 1 ? 0 : 20;
++        SDL_SetRenderDrawColor(renderer, background, background, background, 255);
++#if defined(NDS_HAVE_SDL3)
++        const bool cleared = SDL_RenderClear(renderer);
++        if (monitor == 1) clear_secondary_to_black = lcd < 0 && cleared;
++#else
+         SDL_RenderClear(renderer);
+-        render_screen(presentation, screen, screen_rect);
+-        if (screen == 1 && virtual_stylus_visible)
+-            draw_virtual_stylus(renderer, screen_rect,
+-                                virtual_stylus_x, virtual_stylus_y);
+-        if (screen == 1)
+-            draw_savestate_notice(renderer, screen_rect, savestate_notice);
++#endif
++        if (lcd >= 0) {
++            render_screen(presentation, monitor, screen_rect);
++            if (lcd == 1 && virtual_stylus_visible)
++                draw_virtual_stylus(renderer, screen_rect, virtual_stylus_x, virtual_stylus_y);
++            if (monitor == 0)
++                draw_savestate_notice(renderer, screen_rect, savestate_notice);
++        }
++        if (captured) {
++            SDL_SetRenderTarget(renderer, nullptr);
++            captured_monitors |= 1u << monitor;
++        }
+         ticks.draw += SDL_GetPerformanceCounter() - start;
+-        start = SDL_GetPerformanceCounter();
+-        SDL_RenderPresent(renderer);
+-        ticks.swap += SDL_GetPerformanceCounter() - start;
+-    }
++        present_monitors |= 1u << monitor;
++    }
++    if (captured_monitors & 1u) {
++        sonic_enqueue_history(presentation, captured_monitors, deadline_ns,
++                              history_interval_ns, history_blends, history_blend_secondary, ticks);
++        present_monitors &= ~captured_monitors;
++    } else {
++        sonic_reset_history(presentation);
++    }
++    // The display buffer already paces any renderers using it.
++    if (!(captured_monitors & 1u)) wait_for_presentation(deadline_ns);
++    start = SDL_GetPerformanceCounter();
++    for (int monitor = 0; monitor < monitor_count; ++monitor) {
++        if (!(present_monitors & (1u << monitor))) continue;
++#if defined(NDS_HAVE_SDL3)
++        const bool presented = sonic_present(presentation.renderers[monitor], monitor, 0,
++                                             SonicPresentType::Native);
++        if (monitor == 0 && presented) ++ticks.native_presents;
++        if (monitor == 1) presentation.secondary_black = clear_secondary_to_black && presented;
++#else
++        SDL_RenderPresent(presentation.renderers[monitor]);
++        if (monitor == 0) ++ticks.native_presents;
++#endif
++    }
++    ticks.swap += SDL_GetPerformanceCounter() - start;
+     return ticks;
+ }
+ 
+ } // namespace
  
  int nds_run_interactive_frontend(const NdsFrontendOptions& initial_options) {
++    sonic_present_trace_path = std::getenv("NDS_SONIC_PRESENT_TRACE");
++    sonic_present_sample_count = 0;
      NdsFrontendOptions options = initial_options;
 +    const auto sonic_settings_path=sonic_pc_settings_path(options.runtime_settings_path);
 +    sonic_pc_load(sonic_settings_path);
@@ -569,21 +1257,25 @@
      SDL_SetMainReady();
      // SDL_INIT_TIMER matters on Windows: it raises the OS timer resolution
      // to 1 ms (SDL_HINT_TIMER_RESOLUTION default). Without it SDL_Delay(1)
-@@ -2048,6 +1989,13 @@
+@@ -2044,9 +2533,16 @@
+     }
+ #endif
+     FrontendPresentation presentation{};
+-    if (!create_presentation(options, presentation)) {
++    if (!sonic_create_presentation(options, presentation)) {
          SDL_Quit();
          return 1;
-     }
++    }
 +    g_sonic_window=presentation.windows[0];
 +    g_sonic_renderer=presentation.renderers[0];
 +    if(!sonic_apply_pc_video(presentation,options)){
 +        std::fprintf(stderr,"[sonic-pc] Saved display unavailable; using a window\n");
 +        g_sonic_pc.window_mode=0;g_sonic_pc.resolution=0;g_sonic_pc.filter=0;
 +        sonic_apply_pc_video(presentation,options);
-+    }
+     }
      const int bottom_logical_width = presentation.separate
          ? presentation.screen_widths[1]
-         : presentation.canvas_width;
-@@ -2055,10 +2003,6 @@
+@@ -2055,10 +2551,6 @@
          (bottom_logical_width - kScreenWidth) / 2;
      const int top_content_left = presentation.separate
          ? 0 : (presentation.canvas_width - presentation.screen_widths[0]) / 2;
@@ -594,7 +1286,27 @@
      std::fprintf(stderr,
          "[sdl] layout=%s fullscreen=%s adaptive=%s supersampling=%ux aa=%ux "
          "internal=%ux\n",
-@@ -2158,60 +2102,25 @@
+@@ -2116,8 +2608,17 @@
+     // Activate only after every fallible visible-frontend allocation. From
+     // here onward teardown always destroys the compute renderer while this
+     // context is current.
+-    if (!nds_compute_host_start(
+-            presentation.gl_top ? presentation.windows[0] : nullptr)) {
++    if (g_sonic_pc.internal_resolution && !presentation.gl_top &&
++        !options.adaptive_screens && options.internal_resolution == 1) {
++        if (!sonic_apply_internal_resolution(g_sonic_pc.internal_resolution, 0)) {
++            std::fprintf(stderr, "[sonic-pc] Saved 3D resolution unavailable; using native\n");
++            g_sonic_pc.internal_resolution = 0;
++        }
++        presentation.pc_raster_preset = g_sonic_pc.internal_resolution;
++    } else if ((presentation.gl_top || options.adaptive_screens ||
++                options.internal_resolution > 1 ||
++                nds_gpu3d_renderer_policy() == NdsGpu3dRendererPolicy::Compute) &&
++               !nds_compute_host_start(presentation.gl_top ? presentation.windows[0] : nullptr, true)) {
+         destroy_presentation(presentation);
+         SDL_Quit();
+         return 1;
+@@ -2158,60 +2659,22 @@
          return 1;
      }
  
@@ -663,16 +1375,13 @@
 -                interpolation_refresh_hz, interpolation_min_refresh_hz);
 -        }
 -    }
++    int secondary_refresh_hz = 0;
 +    uint64_t next_refresh_probe_ns = 0;
 +    uint64_t real_deadline_ns = 0;
-+    auto wait_for_presentation = [](uint64_t deadline_ns) {
-+        const uint64_t now_ns = SDL_GetTicksNS();
-+        if (deadline_ns > now_ns) SDL_DelayPrecise(deadline_ns - now_ns);
-+    };
  
      AudioQueue audio_queue{};
      SDL_AudioSpec want{};
-@@ -2333,38 +2242,41 @@
+@@ -2333,38 +2796,61 @@
      publish_keys();
      nds_set_touch(0, 0, false);
      bool running = true;
@@ -693,6 +1402,26 @@
 +    runtime_menu_state.apply_display = [&](const SonicPcPreferences& previous) {
 +        return sonic_apply_pc_video(presentation, options, &previous);
      };
++    runtime_menu_state.apply_internal_resolution = [&](int preset, int) {
++        if (presentation.gl_top || options.adaptive_screens || options.internal_resolution != 1)
++            return false;
++        const int active_preset = presentation.pc_governor_stage >= 2u
++            ? std::min(preset, 4) : preset;
++        const bool applied = active_preset == presentation.pc_raster_preset ||
++            sonic_apply_internal_resolution(active_preset, presentation.pc_raster_preset);
++        if (applied) {
++            presentation.pc_raster_preset = active_preset;
++            for (int screen = 0; screen < 2; ++screen) {
++                if (presentation.raster_textures[screen]) SDL_DestroyTexture(presentation.raster_textures[screen]);
++                presentation.raster_textures[screen] = nullptr;
++                presentation.raster_sizes[screen] = {};
++                presentation.raster_ready[screen] = false;
++            }
++            presentation.raster_failure_logged = false;
++            presentation.raster_success_logged = false;
++        }
++        return applied;
++    };
 +    runtime_menu_state.supports_high_refresh = [&]() {
 +        return !presentation.gl_top &&
 +            window_refresh_hz(presentation.windows[0]) >= interpolation_min_refresh_hz;
@@ -732,7 +1461,7 @@
      bool compute_failed = false;
      bool mouse_down = false;
      bool touch_release_pending = false;
-@@ -2653,6 +2565,7 @@
+@@ -2653,6 +3139,7 @@
          std::fprintf(stderr, "[sdl] relative mouse captured\n");
      };
      uint64_t shown_frames = 0;
@@ -740,7 +1469,7 @@
      uint64_t synthetic_presents = 0;
      FrameBlendCache blend_cache{};
      uint64_t fps_frames = 0;
-@@ -2712,15 +2625,17 @@
+@@ -2712,15 +3199,17 @@
      };
      auto finish_runtime_menu_input = [&](bool was_open) {
          if (runtime_menu_state.close_requested) {
@@ -760,7 +1489,56 @@
      uint64_t host_key_presses = 0;
      uint64_t host_touch_presses = 0;
      int last_touch_event_x = -1;
-@@ -3063,9 +2978,21 @@
+@@ -2790,7 +3279,7 @@
+         g_input_debug.virtual_stylus_y =
+             static_cast<int>(std::lround(mph_virtual_y));
+         g_input_debug.top_window_id = presentation.window_ids[0];
+-        g_input_debug.bottom_window_id = presentation.window_ids[1];
++        g_input_debug.bottom_window_id = presentation.touch_window_id();
+         g_input_debug.bottom_content_left = bottom_content_left;
+         g_input_debug.separate = presentation.separate ? 1 : 0;
+     };
+@@ -2805,7 +3294,20 @@
+     std::string savestate_notice;
+     uint64_t savestate_notice_until = 0;
+ 
++#if defined(NDS_HAVE_SDL3)
++    SDL_Cursor* glove_cursor = sonic_create_glove_cursor();
++    if (!glove_cursor || !SDL_SetCursor(glove_cursor))
++        std::fprintf(stderr, "[sonic-pc] Could not set glove cursor: %s\n", SDL_GetError());
++#endif
++
++    uint32_t previous_touch_window_id = presentation.touch_window_id();
+     while (running) {
++        const uint32_t touch_window_id = presentation.touch_window_id();
++        if (touch_window_id != previous_touch_window_id) {
++            mouse_down = false;
++            touch_release_pending = false;
++            previous_touch_window_id = touch_window_id;
++        }
+ #if defined(NDS_HAVE_COMPUTE_RENDERER)
+         if (!nds_compute_host_make_current()) {
+             std::fprintf(stderr, "[gpu3d] lost compute GL context: %s\n",
+@@ -3016,6 +3518,18 @@
+         }
+         SDL_Event event{};
+         while (SDL_PollEvent(&event)) {
++#if defined(NDS_HAVE_SDL3)
++            if ((event.type >= SDL_EVENT_WINDOW_FIRST && event.type <= SDL_EVENT_WINDOW_LAST &&
++                 event.window.windowID == presentation.window_ids[1]) ||
++                event.type == SDL_EVENT_RENDER_TARGETS_RESET || event.type == SDL_EVENT_RENDER_DEVICE_RESET)
++                presentation.secondary_black = false;
++            if (event.type == SDL_EVENT_RENDER_TARGETS_RESET || event.type == SDL_EVENT_RENDER_DEVICE_RESET) {
++                for (auto& history : presentation.history) history.clear();
++                presentation.history_due_ns = 0;
++            } else if (event.type == SDL_EVENT_WINDOW_PIXEL_SIZE_CHANGED) {
++                sonic_reset_history(presentation);
++            }
++#endif
+             convert_mouse_event_to_logical_coordinates(event, presentation);
+             if (event.type == SDL_QUIT) {
+                 release_relative_mouse();
+@@ -3063,9 +3577,21 @@
                               (int)event.key.repeat);
              }
              if (event.type == SDL_KEYDOWN || event.type == SDL_KEYUP) {
@@ -782,7 +1560,17 @@
                  const bool known = runtime_menu_key_input(
                      scancode, &menu_input);
                  if (known && runtime_ui &&
-@@ -3219,8 +3146,27 @@
+@@ -3133,7 +3659,8 @@
+                                 perf_governor.stage, perf_governor.stage,
+                                 "apply_failed");
+                         }
+-                        blend_cache.valid = false;
++                        blend_cache.lcd_mask = 0;
++                        sonic_reset_history(presentation);
+                         // A load re-primes the machine, so it also opens a new
+                         // digest epoch: it is the only alignment point two
+                         // independently launched processes share, since
+@@ -3219,8 +3746,27 @@
                  event.type == SDL_CONTROLLERBUTTONUP) {
                  RecompRuntimeUiInput menu_input{};
                  const bool was_open = runtime_menu_open();
@@ -812,7 +1600,12 @@
                  if (runtime_menu_controller_input(button, &menu_input) &&
                      runtime_ui &&
                      recomp_runtime_ui_handle_input(
-@@ -3280,6 +3226,12 @@
+@@ -3276,10 +3822,16 @@
+                 event.type == SDL_MOUSEBUTTONDOWN &&
+                 event.button.button == SDL_BUTTON_LEFT &&
+                 presentation.separate &&
+-                event.button.windowID == presentation.window_ids[1];
++                touch_window_id && event.button.windowID == touch_window_id;
              const bool relative_left_down =
                  primary_left_down ||
                  (bottom_left_down && mph_prime_unified_window_focus);
@@ -825,7 +1618,43 @@
              const NdsStackedRelativeMouseRoute stacked_left_route =
                  primary_left_down && !presentation.separate
                      ? nds_route_stacked_relative_mouse_button(
-@@ -3482,7 +3434,8 @@
+@@ -3363,7 +3915,7 @@
+             if (!virtual_stylus_mouse_consumed &&
+                 event.type == SDL_MOUSEBUTTONDOWN &&
+                 event.button.button == SDL_BUTTON_LEFT &&
+-                event.button.windowID == presentation.window_ids[1] &&
++                touch_window_id && event.button.windowID == touch_window_id &&
+                 !(mph_prime_unified_window_focus &&
+                   relative_mouse.captured()) &&
+                 (presentation.separate
+@@ -3384,7 +3936,7 @@
+             if (!virtual_stylus_mouse_consumed &&
+                 event.type == SDL_MOUSEBUTTONUP &&
+                 event.button.button == SDL_BUTTON_LEFT &&
+-                event.button.windowID == presentation.window_ids[1] &&
++                touch_window_id && event.button.windowID == touch_window_id &&
+                 mouse_down) {
+                 mouse_down = false;
+                 // A host click can begin and end while the emulation thread is
+@@ -3398,7 +3950,7 @@
+                                          bottom_logical_width);
+             }
+             if (event.type == SDL_MOUSEMOTION && mouse_down &&
+-                event.motion.windowID == presentation.window_ids[1])
++                touch_window_id && event.motion.windowID == touch_window_id)
+                 set_touch_from_mouse(event.motion.x, event.motion.y, true,
+                                      options.screen_layout,
+                                      bottom_logical_width);
+@@ -3445,7 +3997,7 @@
+             }
+             if (sdl_window_event_is(event, SDL_EVENT_WINDOW_MOUSE_LEAVE) &&
+                 mouse_down &&
+-                event.window.windowID == presentation.window_ids[1]) {
++                touch_window_id && event.window.windowID == touch_window_id) {
+                 mouse_down = false;
+                 if (touch_frames_held < 2)
+                     touch_release_pending = true;
+@@ -3482,7 +4034,8 @@
                      RECOMP_RUNTIME_UI_INPUT_DOWN;
                  const float ax = std::fabs(lx);
                  const float ay = std::fabs(ly);
@@ -835,7 +1664,7 @@
                      have_stick_input = true;
                      if (ax > ay)
                          stick_input = lx > 0.0f
-@@ -3751,11 +3704,19 @@
+@@ -3751,15 +4304,33 @@
          }
          publish_input_debug();
  
@@ -847,7 +1676,13 @@
 +            sonic_menu_paused=sonic_pause_wanted;
 +        }
 +        if(sonic_menu_paused)SDL_Delay(10);
++        const int frame_rate = g_sonic_pc.frame_rate;
++        const bool wants_blending = frame_rate == 2 || (frame_rate == 1 && legacy_interpolation);
++        if (sonic_menu_paused || turbo_active || frame_rate == 0)
++            sonic_reset_history(presentation);
          const uint64_t phase0 = SDL_GetPerformanceCounter();
++        SonicDisplayWaitPump display_pump(presentation);
++        unsigned history_poll = 0;
          const uint64_t now = scheduler_system_timestamp();
          const uint64_t next_frame =
              (now / kSystemCyclesPerFrame + 1u) * kSystemCyclesPerFrame;
@@ -856,15 +1691,33 @@
                 !(scheduler_cpu_terminal_halted(0) &&
                   scheduler_cpu_terminal_halted(1))) {
              scheduler_run_round();
-@@ -3805,6 +3766,34 @@
+-        }
++            if (presentation.history_due_ns && (++history_poll & 7u) == 0)
++                SonicDisplayWaitPump::pump(&display_pump);
++        }
++        const uint64_t emu_display_ticks = display_pump.elapsed;
++        phase_present_ticks += emu_display_ticks;
+         // A real DS power-off is an application lifecycle request, not a
+         // debuggable terminal halt. Leave before presenting the powered-down
+         // black framebuffer; main() performs durable state flushes.
+@@ -3771,7 +4342,7 @@
+         }
+         uint64_t frame_emu_ticks = 0;
+         {
+-            frame_emu_ticks = SDL_GetPerformanceCounter() - phase0;
++            frame_emu_ticks = SDL_GetPerformanceCounter() - phase0 - emu_display_ticks;
+             phase_emu_ticks += frame_emu_ticks;
+             if (frame_emu_ticks > max_emu_ticks) {
+                 max_emu_ticks = frame_emu_ticks;
+@@ -3805,6 +4376,44 @@
          }
  
          const uint64_t phase1 = SDL_GetPerformanceCounter();
 +        const uint64_t ready_ns = SDL_GetTicksNS();
-+        const int frame_rate = g_sonic_pc.frame_rate;
-+        const bool wants_blending = frame_rate == 2 || (frame_rate == 1 && legacy_interpolation);
 +        if (wants_blending && ready_ns >= next_refresh_probe_ns) {
 +            interpolation_refresh_hz = window_refresh_hz(presentation.windows[0]);
++            if (presentation.separate)
++                secondary_refresh_hz = window_refresh_hz(presentation.windows[1]);
 +            next_refresh_probe_ns = ready_ns + 1000000000ull;
 +        } else if (!wants_blending) {
 +            next_refresh_probe_ns = 0;
@@ -874,8 +1727,18 @@
 +        // The audio queue paces the default mode. In blended mode, use
 +        // presentation deadlines so the intermediate frame is visible for
 +        // roughly half a frame, then maintain audio backpressure separately.
++        const SonicFrameView view = sonic_frame_view(presentation.separate,
++            g_sonic_pc.aspect_mode == 1, runtime_menu_open(), nds_gpu2d_presented_main_screen());
++        sonic_present_trace_gameplay = view.player && !sonic_menu_paused;
++#if defined(NDS_HAVE_SDL3)
++        const bool buffered_gameplay = frame_rate != 0 && view.player &&
++            !sonic_menu_paused && !turbo_active && !presentation.gl_top &&
++            !(frame_rate == 1 && legacy_interpolation);
++#else
++        const bool buffered_gameplay = false;
++#endif
 +        const bool wall_paced = !sonic_menu_paused && !turbo_active &&
-+            (interpolation_active || !audio || audio_queue_error);
++            (buffered_gameplay || interpolation_active || !audio || audio_queue_error);
 +        if (wall_paced) {
 +            if (!real_deadline_ns || ready_ns > real_deadline_ns + 2 * frame_duration_ns)
 +                real_deadline_ns = ready_ns;
@@ -891,34 +1754,73 @@
          const uint32_t* const native_top = nds_gpu2d_framebuffer(0);
          const uint32_t* top_pixels = native_top;
          const uint32_t* bottom_pixels = nds_gpu2d_framebuffer(1);
-@@ -3832,18 +3821,21 @@
+@@ -3826,27 +4435,52 @@
+         phase_adaptive_ticks +=
+             SDL_GetPerformanceCounter() - adaptive_start;
+         observe_top_black_bands(native_top, shown_frames);
++        const bool blend_secondary = presentation.separate &&
++            secondary_refresh_hz >= interpolation_min_refresh_hz;
++        unsigned blend_lcds = view.visible_lcds();
++        if (interpolation_active && presentation.separate && !blend_secondary) {
++            // A slower secondary display gets every real frame. Submitting
++            // intermediate frames there adds work to the fast display's path.
++            const auto lcds = sonic_monitor_lcds(g_sonic_pc.dual_monitors_inverted,
++                view.focus, view.boss_hud);
++            blend_lcds = 1u << lcds[0];
++        }
+         // At most ONE synthetic frame, presented ahead of the real one, so
+         // the visible order stays real(N-1), blend(N-1,N), real(N). No
+         // scheduler round, no input sampling, no audio production happens
          // here: this only re-presents pixels that already exist. The direct
          // presenter is excluded above; direct-present frames are excluded
          // again per frame because their top surface lives on the GPU.
 -        if (interpolation_active && blend_cache.valid && !turbo_active &&
-+        if (interpolation_active && blend_cache.valid && wall_paced &&
++        NdsGpu2dPcRasterFrame hd_layers{};
++        const bool high_resolution_3d = g_sonic_pc.internal_resolution &&
++            !runtime_menu_open() && nds_gpu3d_pc_raster_texture() &&
++            (((blend_lcds & 1u) && nds_gpu2d_pc_raster_frame(0, &hd_layers)) ||
++             ((blend_lcds & 2u) && nds_gpu2d_pc_raster_frame(1, &hd_layers)));
++        const uint64_t history_interval_ns = !buffered_gameplay ? 0 :
++            interpolation_active ? half_frame_ns : frame_duration_ns;
++        if (!buffered_gameplay || (presentation.history_due_ns &&
++            presentation.history_interval_ns != history_interval_ns))
++            sonic_reset_history(presentation);
++        if (!buffered_gameplay && !high_resolution_3d && interpolation_active &&
++            blend_cache.lcd_mask == blend_lcds && wall_paced &&
              !nds_gpu2d_direct_present_frame_active() &&
 -            blend_cache.widths[0] == top_width &&
 -            blend_cache.widths[1] == bottom_width && audio_started &&
 -            audio_queue_count(audio, audio_queue) >
 -                kInterpolationAudioFloorFrames) {
-+            blend_cache.widths[0] == top_width && blend_cache.widths[1] == bottom_width &&
-+            (g_sonic_focus_screen < 0 ||
-+             nds_gpu2d_presented_main_screen() == g_sonic_focus_screen) &&
+-            blend_half(blend_cache.previous[0].data(), top_pixels,
+-                       blend_cache.blended[0].data(),
+-                       blend_cache.previous[0].size());
+-            blend_half(blend_cache.previous[1].data(), bottom_pixels,
+-                       blend_cache.blended[1].data(),
+-                       blend_cache.previous[1].size());
++            (!(blend_lcds & 1u) || blend_cache.widths[0] == top_width) &&
++            (!(blend_lcds & 2u) || blend_cache.widths[1] == bottom_width) &&
++            view.focus == g_sonic_focus_screen &&
 +            SDL_GetTicksNS() <= blend_deadline_ns + 1000000ull &&
 +            (!audio || (audio_started && !audio_queue_error &&
 +             audio_queue_count(audio, audio_queue) > blend_audio_floor))) {
-             blend_half(blend_cache.previous[0].data(), top_pixels,
-                        blend_cache.blended[0].data(),
-                        blend_cache.previous[0].size());
-             blend_half(blend_cache.previous[1].data(), bottom_pixels,
-                        blend_cache.blended[1].data(),
-                        blend_cache.previous[1].size());
-+            wait_for_presentation(blend_deadline_ns);
++            const uint32_t* blended_pixels[] = {top_pixels, bottom_pixels};
++            for (int lcd = 0; lcd < 2; ++lcd) {
++                if (!(blend_lcds & (1u << lcd))) continue;
++                blend_half(blend_cache.previous[lcd].data(), blended_pixels[lcd],
++                           blend_cache.blended[lcd].data(), blend_cache.previous[lcd].size());
++                blended_pixels[lcd] = blend_cache.blended[lcd].data();
++            }
              const PresentationTicks synthetic_ticks = present_screens(
-                 presentation, blend_cache.blended[0].data(), top_width,
-                 blend_cache.blended[1].data(), bottom_width,
-@@ -3862,33 +3854,39 @@
+-                presentation, blend_cache.blended[0].data(), top_width,
+-                blend_cache.blended[1].data(), bottom_width,
++                presentation, view, blend_deadline_ns, blend_secondary,
++                blended_pixels[0], top_width,
++                blended_pixels[1], bottom_width,
+                 runtime_ui,
+                 mph_prime_virtual_stylus || generic_virtual_stylus,
+                 mph_virtual_x, mph_virtual_y,
+@@ -3862,39 +4496,50 @@
              // phase_present_ticks is measured from phase1, which already
              // encloses this block; only the sub-counters need folding in.
              ++synthetic_presents;
@@ -946,15 +1848,16 @@
 -        phase_swap_ticks += presentation_ticks.swap;
 -        // Digest the exact surfaces the presenter was handed, after the
 -        // present so the hash cost is never inside a measured present phase.
-+        if (wall_paced) wait_for_presentation(real_deadline_ns);
 +        if (present_this_frame) {
 +            const PresentationTicks presentation_ticks = present_screens(
-+                presentation, top_pixels, top_width,
++                presentation, view, wall_paced ? real_deadline_ns : 0, true,
++                top_pixels, top_width,
 +                bottom_pixels, bottom_width,
 +                runtime_ui,
 +                mph_prime_virtual_stylus || generic_virtual_stylus,
 +                mph_virtual_x, mph_virtual_y,
-+                savestate_notice.empty() ? nullptr : savestate_notice.c_str());
++                savestate_notice.empty() ? nullptr : savestate_notice.c_str(),
++                history_interval_ns, interpolation_active, blend_secondary);
 +            if (!presentation_ticks.ok) {
 +                compute_failed = true;
 +                running = false;
@@ -963,8 +1866,12 @@
 +            phase_upload_ticks += presentation_ticks.upload;
 +            phase_draw_ticks += presentation_ticks.draw;
 +            phase_swap_ticks += presentation_ticks.swap;
-+            ++real_presents;
-+            ++fps_frames;
++            real_presents += presentation_ticks.native_presents;
++            synthetic_presents += presentation_ticks.blended_presents;
++            fps_frames += presentation_ticks.native_presents + presentation_ticks.blended_presents +
++                          presentation_ticks.repeated_presents;
++        } else if (wall_paced) {
++            wait_for_presentation(real_deadline_ns);
 +        }
 +        // Keep the digest tied to guest frames, even when every other
 +        // frame is skipped by the display. Never blend a paused menu frame.
@@ -972,24 +1879,58 @@
                              bottom_pixels, bottom_width,
                              nds_gpu2d_direct_present_frame_active());
 -        if (interpolation_active &&
-+        if (interpolation_active && wall_paced &&
++        if (!buffered_gameplay && interpolation_active && wall_paced &&
              !nds_gpu2d_direct_present_frame_active()) {
-             cache_presented_frame(blend_cache, 0, top_pixels, top_width);
-             cache_presented_frame(blend_cache, 1, bottom_pixels, bottom_width);
-@@ -3915,9 +3913,10 @@
+-            cache_presented_frame(blend_cache, 0, top_pixels, top_width);
+-            cache_presented_frame(blend_cache, 1, bottom_pixels, bottom_width);
+-            blend_cache.valid = true;
++            if (blend_lcds & 1u) cache_presented_frame(blend_cache, 0, top_pixels, top_width);
++            if (blend_lcds & 2u) cache_presented_frame(blend_cache, 1, bottom_pixels, bottom_width);
++            blend_cache.lcd_mask = blend_lcds;
+         } else {
+-            blend_cache.valid = false;
++            blend_cache.lcd_mask = 0;
+         }
+         phase_present_ticks += SDL_GetPerformanceCounter() - phase1;
+         if (audio && audio_started) {
+@@ -3902,6 +4547,7 @@
+             audio_min_queue = std::min(audio_min_queue, queued);
+         }
+         const uint64_t phase2 = SDL_GetPerformanceCounter();
++        const uint64_t pre_drain_display_ticks = display_pump.elapsed;
+         // Glide: after the prebuffered start, the pacing allowance decays a
+         // fixed step per frame from the prebuffer level down to the steady
+         // 63 ms target, shedding the extra startup latency over a couple of
+@@ -3915,13 +4561,24 @@
          if (turbo_active) {
              discard_spu_output();
          } else {
 +            const uint32_t queue_limit = audio_pace_floor +
-+                (interpolation_active && wall_paced ? blend_audio_headroom : 0u);
++                ((interpolation_active || buffered_gameplay) && wall_paced ? blend_audio_headroom : 0u);
              queued = drain_audio(
 -                audio, audio_queue, audio_started, audio_pace_floor,
 -                audio_queue_error);
-+                audio, audio_queue, audio_started, queue_limit, audio_queue_error);
-         }
+-        }
++                audio, audio_queue, audio_started, queue_limit, audio_queue_error,
++                presentation.history_due_ns ? SonicDisplayWaitPump::pump : nullptr,
++                &display_pump);
++        }
++        const uint64_t audio_display_ticks = display_pump.elapsed - pre_drain_display_ticks;
          const uint64_t frame_drain_ticks =
-             SDL_GetPerformanceCounter() - phase2;
-@@ -4003,7 +4002,6 @@
+-            SDL_GetPerformanceCounter() - phase2;
++            SDL_GetPerformanceCounter() - phase2 - audio_display_ticks;
+         phase_drain_ticks += frame_drain_ticks;
++        phase_present_ticks += audio_display_ticks;
++        phase_draw_ticks += display_pump.ticks.draw;
++        phase_swap_ticks += display_pump.ticks.swap;
++        real_presents += display_pump.ticks.native_presents;
++        synthetic_presents += display_pump.ticks.blended_presents;
++        fps_frames += display_pump.ticks.native_presents + display_pump.ticks.blended_presents +
++                      display_pump.ticks.repeated_presents;
+         audio_max_queue = std::max(audio_max_queue, queued);
+         if (audio && !audio_started && !turbo_active &&
+             queued >= audio_start_threshold) {
+@@ -4003,7 +4660,6 @@
          }
  
          ++shown_frames;
@@ -997,7 +1938,7 @@
          g_live_stats.frames = shown_frames;
          g_live_stats.emu_ticks = phase_emu_ticks;
          g_live_stats.present_ticks = phase_present_ticks;
-@@ -4013,7 +4011,7 @@
+@@ -4013,7 +4669,7 @@
          g_live_stats.swap_ticks = phase_swap_ticks;
          g_live_stats.drain_ticks = phase_drain_ticks;
          g_live_stats.underruns = current_underruns;
@@ -1006,7 +1947,7 @@
          g_live_stats.synthetic_presents = synthetic_presents;
          g_live_stats.perf_governor_stage = perf_governor.stage;
          g_live_stats.perf_governor_over_frames = perf_governor.over_frames;
-@@ -4045,16 +4043,16 @@
+@@ -4045,16 +4701,16 @@
                            (perf_governor.stage2_held ? " held" : "")
                      : "";
              const std::string top_title = !savestate_notice.empty()
@@ -1015,7 +1956,7 @@
                  : presentation.separate
 -                ? "ndsrecomp - Top Screen - " + fps_text + governor_text
 -                : "ndsrecomp firmware preview - " + fps_text +
-+                ? "Sonic Rush - Top Screen - " + fps_text + governor_text
++                ? "Sonic Rush - Primary Display - " + fps_text + governor_text
 +                : "Sonic Rush - " + fps_text +
                        governor_text;
              SDL_SetWindowTitle(presentation.windows[0],
@@ -1023,19 +1964,33 @@
              if (presentation.separate) {
                  const std::string bottom_title =
 -                    "ndsrecomp - Bottom Screen - " + fps_text +
-+                    "Sonic Rush - Bottom Screen - " + fps_text +
++                    "Sonic Rush - Secondary Display - " + fps_text +
                      governor_text;
                  SDL_SetWindowTitle(presentation.windows[1],
                                     bottom_title.c_str());
-@@ -4107,6 +4105,7 @@
+@@ -4083,6 +4739,7 @@
+     g_live_stats.active = 0;
+     g_input_debug.active = 0;
+     nds_diagnostics_stop_performance_log();
++    sonic_write_present_trace();
+     const double soak_seconds = static_cast<double>(
+         SDL_GetPerformanceCounter() - soak_start) /
+         static_cast<double>(frequency);
+@@ -4107,6 +4764,13 @@
          recomp_runtime_ui_destroy(runtime_ui);
          runtime_ui = nullptr;
      }
++#if defined(NDS_HAVE_SDL3)
++    if (glove_cursor) {
++        SDL_SetCursor(SDL_GetDefaultCursor());
++        SDL_DestroyCursor(glove_cursor);
++    }
++#endif
 +    g_sonic_window=nullptr;g_sonic_renderer=nullptr;g_sonic_menu=nullptr;
      destroy_presentation(presentation);
      SDL_Quit();
      std::fprintf(stderr, "[sdl] closed after %llu presented frames\n",
-@@ -4155,10 +4154,11 @@
+@@ -4155,10 +4819,11 @@
          std::fprintf(stderr,
              "[sdl] frame interpolation: mode=%s active=%u refresh=%dHz "
              "min_refresh=%dHz real_presents=%llu synthetic_presents=%llu\n",
@@ -1049,7 +2004,17 @@
              static_cast<unsigned long long>(synthetic_presents));
          nds_profile_report(stderr);
      }
-@@ -4306,12 +4306,13 @@
+@@ -4294,7 +4959,8 @@
+ 
+ bool nds_frontend_debug_touch(uint16_t x, uint16_t y, bool down) {
+ #if defined(NDS_HAVE_SDL3) || defined(NDS_HAVE_SDL2)
+-    if (!g_input_debug.active || x >= kScreenWidth || y >= kScreenHeight)
++    if (!g_input_debug.active || !g_input_debug.bottom_window_id ||
++        x >= kScreenWidth || y >= kScreenHeight)
+         return false;
+     SDL_Event event{};
+     event.type = down ? SDL_MOUSEBUTTONDOWN : SDL_MOUSEBUTTONUP;
+@@ -4306,12 +4972,23 @@
      event.button.down = down;
  #endif
      event.button.clicks = 1;
@@ -1060,16 +2025,26 @@
 -                                                   static_cast<int>(y)) *
 -                     kWindowScale;
 +    const auto& rect = g_sonic_screen_layout.lcd[1];
-+    if (!rect.w) return false;
-+    const float logical_x = rect.x + (rect.w - kScreenWidth) / 2 + x;
-+    const float logical_y = rect.y + y;
-+    if (!g_sonic_renderer || !SDL_RenderCoordinatesToWindow(
-+            g_sonic_renderer, logical_x, logical_y, &event.button.x, &event.button.y))
++    SDL_Renderer* renderer = g_sonic_renderer;
++    float logical_x = rect.x + (rect.w - kScreenWidth) / 2 + x;
++    float logical_y = rect.y + y;
++    if (g_input_debug.separate) {
++        renderer = SDL_GetRenderer(SDL_GetWindowFromID(g_input_debug.bottom_window_id));
++        int width = 0;
++        if (!renderer || !SDL_GetRenderLogicalPresentation(renderer, &width, nullptr, nullptr))
++            return false;
++        logical_x = (width - kScreenWidth) / 2 + x;
++        logical_y = y;
++    } else if (!rect.w) {
++        return false;
++    }
++    if (!renderer || !SDL_RenderCoordinatesToWindow(
++            renderer, logical_x, logical_y, &event.button.x, &event.button.y))
 +        return false;
      const bool pushed = sdl_push_event(event);
      if (pushed) ++g_input_debug.debug_touch_events;
      else ++g_input_debug.debug_event_errors;
-@@ -4409,3 +4410,55 @@
+@@ -4409,3 +5086,58 @@
      if (after - from > kFrameDigestRing) return 0;
      return copied;
  }
@@ -1109,6 +2084,9 @@
 +        ",\"output_width\":"+std::to_string(output_width)+
 +        ",\"output_height\":"+std::to_string(output_height)+
 +        ",\"filter\":"+std::to_string(g_sonic_pc.filter)+
++        ",\"dual_monitors\":"+std::to_string(g_sonic_pc.dual_monitors)+
++        ",\"dual_monitors_active\":"+std::to_string(g_input_debug.active && g_input_debug.separate ? 1 : 0)+
++        ",\"glove_cursor\":"+std::to_string(g_sonic_window && SDL_GetCursor() != SDL_GetDefaultCursor() ? 1 : 0)+
 +        ",\"menu_open\":"+std::to_string(g_sonic_menu && g_sonic_menu->ui && recomp_runtime_ui_is_open(g_sonic_menu->ui)?1:0)+
 +        ",\"capture\":"+std::to_string(g_sonic_menu?g_sonic_menu->capture_kind:0)+
 +        ",\"text_edit\":"+std::to_string(g_sonic_menu ?
@@ -1141,14 +2119,28 @@
 +std::string nds_sonic_pc_debug_state();
 --- a/runner/src/gpu2d.cpp
 +++ b/runner/src/gpu2d.cpp
-@@ -1,4 +1,6 @@
-+// Modified for rush05-recomp by ChatGPT in 2026. See NOTICE.md for scope.
+@@ -1,4 +1,5 @@
  #include "gpu2d.h"
 +#include "sonic_lcd_routing.h"
  #include "host_profile.h"
  #include "gpu2d_window.h"
  
-@@ -165,6 +167,7 @@
+@@ -150,6 +151,14 @@
+ std::vector<uint32_t> g_hd_top_pixels;
+ std::vector<uint32_t> g_hd_below_pixels;
+ NdsGpu2dHdFrame g_hd_frame{};
++struct PcRasterLayers {
++    std::array<uint32_t, 256 * 192 * 2> top{};
++    std::array<uint32_t, 256 * 192 * 2> below{};
++    // BLDCNT, master brightness, scroll/route, and blend coefficients.
++    std::array<uint32_t, 192 * 4> scanlines{};
++};
++PcRasterLayers g_pc_layers[2];
++bool g_main_displayed_3d[2]{};
+ 
+ uint32_t hd_meta(const Pixel& p, bool effects_enabled) {
+     return static_cast<uint32_t>(p.target & 0x3Fu) |
+@@ -165,6 +174,7 @@
  bool g_adaptive_hud_anchor = false;
  int g_adaptive_hud_center_width = 64;
  int g_front = 0;
@@ -1156,7 +2148,63 @@
  uint64_t g_render_ns = 0;
  uint64_t g_obj_ns = 0;
  uint64_t g_engine_ns[2] = {};
-@@ -1634,6 +1637,9 @@
+@@ -1079,6 +1089,7 @@
+     int y = 0;
+     bool engine_active[2]{};
+     bool bg0_3d = false;
++    bool pc_raster = false;
+     bool cap = false;
+     uint32_t capw = 0;
+     uint8_t direct_class = 0;
+@@ -1115,7 +1126,7 @@
+ void compose_line6(int engine, int y, const Unit& u, const uint8_t* palette,
+                    const uint8_t* oam, const NdsVramRendererView& vram,
+                    const uint32_t* line3d, bool bg0_3d, uint32_t* out,
+-                   LineScratch& sc) {
++                   LineScratch& sc, PcRasterLayers* layers) {
+     std::array<Pixel,256>& obj = sc.obj;
+     std::array<uint8_t,256>& obj_window = sc.obj_window;
+     const auto obj_start = profiling() ? std::chrono::steady_clock::now()
+@@ -1161,6 +1172,20 @@
+             push(Pixel{rgb6(static_cast<uint16_t>(c & 0x7FFFu)),
+                        l.target, 0, l.prio, l.order, true});
+         }
++        if (obj[x].valid && (window_mask & 0x10u)) push(obj[x]);
++        if (layers) {
++            const size_t offset = (y * 256u + x) * 2u;
++            const uint32_t flags = (window_mask & 0x20u ? 128u : 0u) |
++                                   (window_mask & 1u ? 64u : 0u);
++            auto meta = [flags](const Pixel& p) {
++                return flags | p.target | (uint32_t{p.alpha} << 8) |
++                       (uint32_t{p.priority} << 16) | (uint32_t{p.order} << 24);
++            };
++            layers->top[offset] = top.color;
++            layers->top[offset + 1] = meta(top);
++            layers->below[offset] = below.color;
++            layers->below[offset + 1] = meta(below);
++        }
+         if (bg0_3d && line3d && (window_mask & 0x01u)) {
+             const uint32_t c3 = line3d[x];
+             const uint8_t a3 = static_cast<uint8_t>((c3 >> 24) & 0x1Fu);
+@@ -1169,7 +1194,6 @@
+             if (a3)
+                 push(Pixel{c3 & 0x003F3F3Fu, 0x01u, 0, prio3d, 1, true, a3});
+         }
+-        if (obj[x].valid && (window_mask & 0x10u)) push(obj[x]);
+         out[x] = compose(u, top, below, (window_mask & 0x20u) != 0u);
+     }
+ }
+@@ -1327,7 +1351,8 @@
+             mode == 1u || (cap && !(u.capture & 0x01000000u));
+         if (need_comp)
+             compose_line6(engine, y, u, palette, oam, vram, line3d,
+-                          bg0_3d, comp6.data(), sc);
++                          bg0_3d, comp6.data(), sc,
++                          engine == 0 && job.pc_raster ? &g_pc_layers[job.buffer] : nullptr);
+         const uint32_t mbmode = u.master_bright >> 14;
+         const uint32_t mb = std::min<uint32_t>(16, u.master_bright & 0x1Fu);
+         auto bright = [&](uint32_t c6) {
+@@ -1634,6 +1659,9 @@
      job.y = y;
      job.buffer = static_cast<uint32_t>(g_front ^ 1);
      job.line3d = nullptr;
@@ -1166,33 +2214,83 @@
      job.direct_class = static_cast<uint8_t>(g_direct_frame_class);
      job.direct_extra_bg_mask = g_direct_extra_bg_mask;
      for (int e = 0; e < 2; ++e) {
-@@ -2047,6 +2053,7 @@
+@@ -1667,6 +1695,20 @@
+     }
+     job.bg0_3d = (job.unit[0].dispcnt & 0x8u) != 0 &&
+                  (job.unit[0].dispcnt & 0x100u) != 0;
++
++    const bool direct_3d = job.engine_active[0] && !line_forceblank(job, 0) &&
++        job.bg0_3d && ((job.unit[0].dispcnt >> 16) & 3u) == 1u;
++    if (direct_3d) g_main_displayed_3d[job.buffer] = true;
++    job.pc_raster = direct_3d && nds_gpu3d_pc_raster_line_ready();
++    if (job.pc_raster) {
++        const auto& u = job.unit[0];
++        auto* config = g_pc_layers[job.buffer].scanlines.data() + y * 4;
++        config[0] = u.bldcnt;
++        config[1] = u.master_bright;
++        config[2] = (1u + job.screen[0]) | (uint32_t{nds_gpu3d_render_xpos()} << 8) |
++                    (uint32_t{u.bgcnt[0] & 3u} << 24);
++        config[3] = u.eva | (uint32_t{u.evb} << 8) | (uint32_t{u.evy} << 16);
++    }
+ 
+     // The 3D line and the wide-3D snapshot are pulled here, in scanline order,
+     // under exactly the condition the inline render used: GPU3D::GetLine writes
+@@ -2046,7 +2088,10 @@
+ void nds_gpu2d_reset(){
      drain_pool(NDS_GPU2D_FENCE_FRAME);
      g_unit={};
++    for (auto& layers : g_pc_layers) layers.scanlines.fill(0);
++    g_main_displayed_3d[0] = g_main_displayed_3d[1] = false;
      g_front = 0;
 +    g_present_main_route={};
      g_direct_frame_active = false;
      g_direct_present_frame_active = false;
      g_frame_capture_active = false;
-@@ -2207,6 +2214,7 @@
+@@ -2207,6 +2252,9 @@
          }
      }
      g_front = in.front;
++    for (auto& layers : g_pc_layers) layers.scanlines.fill(0);
++    g_main_displayed_3d[0] = g_main_displayed_3d[1] = false;
 +    g_present_main_route={};
      g_frame_capture_active = in.frame_capture_active != 0u;
      g_present_capture_active = in.present_capture_active != 0u;
  
-@@ -2364,6 +2372,9 @@
+@@ -2364,7 +2412,32 @@
  void nds_gpu2d_finish_frame(){
      drain_pool(NDS_GPU2D_FENCE_FRAME);
      g_front ^= 1;
+-}
 +    // io.cpp calls start_frame before finish_frame at the wrap. Clear the
 +    // newly reusable back buffer only AFTER publishing the completed one.
 +    g_present_main_route.published(g_front);
- }
++    g_pc_layers[g_front ^ 1].scanlines.fill(0);
++    g_main_displayed_3d[g_front ^ 1] = false;
++}
++
++bool nds_gpu2d_pc_raster_needed() {
++    const uint32_t dispcnt = g_unit[0].dispcnt;
++    // Use HD if either the finished scanouts or live registers expect BG0 3D.
++    // Display capture still needs a native raster when it feeds sprite VRAM.
++    const bool configured_3d = (dispcnt & 0x00030188u) == 0x00010108u;
++    return configured_3d || g_main_displayed_3d[g_front ^ 1];
++}
++
++bool nds_gpu2d_pc_raster_frame(int lcd, NdsGpu2dPcRasterFrame* out) {
++    const auto& layers = g_pc_layers[g_front];
++    for (size_t y = 0; y < 192; ++y) {
++        if ((layers.scanlines[4 * y + 2] & 3u) != static_cast<uint32_t>(lcd + 1))
++            continue;
++        *out = {layers.top.data(), layers.below.data(), layers.scanlines.data()};
++        return true;
++    }
++    return false;
++}
++
  void nds_gpu2d_vblank(){
      drain_pool(NDS_GPU2D_FENCE_FRAME);
-@@ -2375,6 +2386,9 @@
+     // melonDS Unit::VBlank: the capture enable bit auto-clears at line 192
+@@ -2375,6 +2448,9 @@
              u.capture_latch = false;
          }
      }
@@ -1204,12 +2302,7 @@
      drain_pool(NDS_GPU2D_FENCE_PRESENT);
 --- a/runner/src/gpu2d.h
 +++ b/runner/src/gpu2d.h
-@@ -1,3 +1,4 @@
-+// Modified for rush05-recomp by ChatGPT in 2026. See NOTICE.md for scope.
- #pragma once
- 
- #include <atomic>
-@@ -73,6 +74,8 @@
+@@ -73,6 +73,8 @@
  // StartScanline order.
  void nds_gpu2d_vblank();
  const uint32_t* nds_gpu2d_framebuffer(int screen);
@@ -1218,6 +2311,21 @@
  // Host-only adaptive presentation surface. Returns the native framebuffer
  // with width=256 when no enhanced surface is active for this physical LCD.
  const uint32_t* nds_gpu2d_adaptive_framebuffer(int screen, uint16_t* width);
+@@ -122,6 +124,14 @@
+ //
+ // The 2D layers stay at native density, which is what the hardware draws;
+ // only the 3D layer gains resolution.
++struct NdsGpu2dPcRasterFrame {
++    const uint32_t* top;
++    const uint32_t* below;
++    const uint32_t* scanlines;
++};
++bool nds_gpu2d_pc_raster_frame(int lcd, NdsGpu2dPcRasterFrame* out);
++bool nds_gpu2d_pc_raster_needed();
++
+ struct NdsGpu2dHdFrame {
+     // RG32UI pairs, width x 192: [0] = RGB6 colour (channels at bits
+     // 0/8/16), [1] = BLDCNT target in bits 0..5 | effects enable bit 7 |
 --- a/runner/src/io.cpp
 +++ b/runner/src/io.cpp
 @@ -1,3 +1,4 @@
@@ -1613,3 +2721,796 @@ diff --git a/runner/src/tier3.cpp b/runner/src/tier3.cpp
          const bool condition_passed = Interpreter::cond_passes(in.cond, ic.cpsr);
          const bool traced =
              g_runtime_deep_trace &&
+--- a/runner/src/gpu3d.cpp
++++ b/runner/src/gpu3d.cpp
+@@ -123,6 +123,7 @@
+ // shader constants would otherwise permit.
+ constexpr uint8_t kMaxInternalScale = 4u;
+ uint8_t g_internal_scale = 1u;
++uint16_t g_pc_raster_height = 0;
+ #if defined(NDS_HAVE_COMPUTE_RENDERER)
+ bool g_display_readback_latency = false;
+ bool g_compute_rendered_frame = false;
+@@ -341,23 +342,14 @@
+     // guest emulation plus the present that separate the two points.
+     bool valid = true;
+     const void* mapped = nullptr;
++    if (g_compute_fence)
++        valid = nds_compute_host_wait_on_fence(g_compute_fence);
+     if (g_compute_pbo_map) {
+-        if (g_compute_fence) {
+-            // GL_SYNC_FLUSH_COMMANDS_BIT is redundant after the submit-side
+-            // glFlush and costs nothing; it keeps this correct if a future
+-            // caller ever submits without flushing.
+-            constexpr GLuint64 kReadbackTimeoutNs = 5ull * 1000000000ull;
+-            const GLenum status = glClientWaitSync(
+-                g_compute_fence, GL_SYNC_FLUSH_COMMANDS_BIT,
+-                kReadbackTimeoutNs);
+-            if (status == GL_WAIT_FAILED || status == GL_TIMEOUT_EXPIRED)
+-                valid = false;
+-        }
+         if (valid && frame_bytes <= g_compute_pbo_bytes)
+             mapped = g_compute_pbo_map;
+         else
+             valid = false;
+-    } else {
++    } else if (valid) {
+         // PrepareCaptureFrame left the renderer's PBO bound.
+         mapped = glMapBuffer(GL_PIXEL_PACK_BUFFER, GL_READ_ONLY);
+         valid = mapped != nullptr;
+@@ -665,6 +657,35 @@
+ #endif
+ }
+ 
++bool nds_gpu3d_set_pc_raster_height(uint16_t height) {
++    if (height && (height < 192 || height > 2160 || nds_gpu3d_output_width() != 256))
++        return false;
++    g_pc_raster_height = height;
++    return true;
++}
++
++bool nds_gpu3d_pc_raster_line_ready() {
++#if defined(NDS_HAVE_COMPUTE_RENDERER)
++    if (g_pc_raster_height <= 192 || !g_compute_frame_ready || g_nds.GPU.GPU3D.AbortFrame)
++        return false;
++    const auto* renderer = dynamic_cast<melonDS::ComputeRenderer*>(
++        &g_nds.GPU.GPU3D.GetCurrentRenderer());
++    return renderer && renderer->HasPcRaster();
++#else
++    return false;
++#endif
++}
++
++uint32_t nds_gpu3d_pc_raster_texture() {
++#if defined(NDS_HAVE_COMPUTE_RENDERER)
++    auto* renderer = dynamic_cast<melonDS::ComputeRenderer*>(
++        &g_nds.GPU.GPU3D.GetCurrentRenderer());
++    if (renderer && g_pc_raster_height > 192)
++        return renderer->GetPresentedTexture();
++#endif
++    return 0;
++}
++
+ bool nds_gpu3d_set_internal_scale(uint8_t scale) {
+     if (scale < 1u || scale > kMaxInternalScale) return false;
+ #if defined(NDS_HAVE_COMPUTE_RENDERER)
+@@ -788,8 +809,16 @@
+     // scale 1. Higher internal-resolution modes use melonDS's sub-native
+     // vertex coordinates so the extra samples reduce polygon/texture wobble
+     // rather than merely magnifying the native integer grid.
+-    renderer->SetRenderSettings(
+-        static_cast<int>(g_internal_scale), g_internal_scale > 1u);
++    if (!renderer->SetRenderSettings(static_cast<int>(g_internal_scale),
++                                     g_internal_scale > 1u || g_pc_raster_height > 192,
++                                     g_pc_raster_height)) {
++        std::fprintf(stderr, "[gpu3d] requested raster exceeds OpenGL limits\n");
++        return false;
++    }
++    if (g_pc_raster_height > 192)
++        std::fprintf(stderr, "[gpu3d] PC 3D raster %ux%u\n",
++                     (render_width * g_pc_raster_height + 96u) / 192u,
++                     static_cast<unsigned>(g_pc_raster_height));
+     if (compute_gl_stage_failed("render settings")) return false;
+     if (g_internal_scale > 1u)
+         std::fprintf(stderr,
+@@ -797,24 +826,40 @@
+                      static_cast<unsigned>(g_internal_scale),
+                      render_width * g_internal_scale,
+                      192u * g_internal_scale);
+-    while (renderer->NeedsShaderCompile()) {
+-        int current = 0;
+-        int count = 0;
+-        renderer->ShaderCompileStep(current, count);
+-        std::fprintf(stderr, "[gpu3d] compute shader %d/%d\r",
+-                     current + 1, count);
+-        if (g_compute_shader_setup_failed ||
+-            compute_gl_stage_failed("shader setup")) {
+-            std::fprintf(stderr,
+-                         "[gpu3d] compute shader setup failed at %d/%d\n",
+-                         current + 1, count);
++    auto compile_shaders = [](melonDS::ComputeRenderer& raster) {
++        while (raster.NeedsShaderCompile()) {
++            int current = 0;
++            int count = 0;
++            raster.ShaderCompileStep(current, count);
++            std::fprintf(stderr, "[gpu3d] compute shader %d/%d\r", current + 1, count);
++            if (g_compute_shader_setup_failed || compute_gl_stage_failed("shader setup")) {
++                std::fprintf(stderr, "[gpu3d] compute shader setup failed at %d/%d\n",
++                             current + 1, count);
++                return false;
++            }
++        }
++        return true;
++    };
++    if (!compile_shaders(*renderer)) return false;
++    if (g_pc_raster_height > 192) {
++        auto native = melonDS::ComputeRenderer::New();
++        if (!native || compute_gl_stage_failed("native raster initialization")) return false;
++        native->SetRenderWidth(render_width);
++        if (!native->SetRenderSettings(1, false) ||
++            compute_gl_stage_failed("native raster settings") ||
++            !compile_shaders(*native))
+             return false;
+-        }
++        renderer->SetNativeRaster(std::move(native));
+     }
+     std::fprintf(stderr, "[gpu3d] compute shaders ready          \n");
+     std::fprintf(stderr, "[gpu3d] compute readback overlap: %s\n",
+                  compute_readback_overlap() ? "on" : "off");
+     g_nds.GPU.GPU3D.SetCurrentRenderer(std::move(renderer));
++    if (g_pc_raster_height > 192) {
++        auto& gpu = g_nds.GPU.GPU3D;
++        gpu.GetCurrentRenderer().Reset(g_nds.GPU);
++        gpu.RenderFrameIdentical = false;
++    }
+     compute_readback_init(render_width);
+     std::fprintf(stderr, "[gpu3d] compute readback buffer: %s\n",
+                  g_compute_readback_mode);
+@@ -1195,6 +1240,14 @@
+     // NdsGpu3dProfile are a breakdown of this region, not an addend to it.
+     NdsEmuScope emu_region(NDS_EMU_GPU3D_FRAME);
+ #if defined(NDS_HAVE_COMPUTE_RENDERER)
++    if (g_pc_raster_height > 192) {
++        auto* renderer = dynamic_cast<melonDS::ComputeRenderer*>(
++            &g_nds.GPU.GPU3D.GetCurrentRenderer());
++        if (renderer) {
++            renderer->LatchPresentedTexture();
++            renderer->UseNativeRaster(!nds_gpu2d_pc_raster_needed());
++        }
++    }
+     if (g_nds.GPU.GPU3D.IsRendererAccelerated() &&
+         g_display_readback_latency && g_compute_readback_pending)
+         compute_finish_readback();
+--- a/runner/src/gpu3d.h
++++ b/runner/src/gpu3d.h
+@@ -60,6 +60,9 @@
+ // accelerated renderer for the governor path. Both return false for an
+ // out-of-range scale (valid range 1..4).
+ bool nds_gpu3d_set_internal_scale(uint8_t scale);
++bool nds_gpu3d_set_pc_raster_height(uint16_t height);
++bool nds_gpu3d_pc_raster_line_ready();
++uint32_t nds_gpu3d_pc_raster_texture();
+ bool nds_gpu3d_set_runtime_internal_scale(uint8_t scale);
+ uint8_t nds_gpu3d_internal_scale();
+ void nds_gpu3d_set_display_readback_latency(bool enabled);
+--- a/runner/src/melonds_compute/ComputeHost.cpp
++++ b/runner/src/melonds_compute/ComputeHost.cpp
+@@ -1,6 +1,7 @@
+ // GPL-3.0-or-later; see ComputeHost.h and THIRD_PARTY_ATTRIBUTION.md.
+ #include "ComputeHost.h"
+ 
++#include <chrono>
+ #include <cstdio>
+ #include <cstdlib>
+ #include <cstring>
+@@ -34,6 +35,15 @@
+ GLuint g_hd_below_texture[2] = {};
+ int g_texture_width = 0;
+ unsigned g_present_buffer = 0;
++GLuint g_pc_scanlines = 0;
++GLuint g_pc_framebuffer = 0;
++GLuint g_pc_readback = 0;
++size_t g_pc_readback_bytes = 0;
++NdsComputeWaitPump g_wait_pump = nullptr;
++void* g_wait_context = nullptr;
++GLuint g_pc_color = 0;
++int g_pc_width = 0;
++int g_pc_height = 0;
+ 
+ // GL identity, captured once the context is current. Fixed buffers rather
+ // than std::string: this is read from the diagnostics sampler, and the
+@@ -188,6 +198,8 @@
+ layout(binding = 5) uniform usampler2D texHdBelow;
+ layout(location = 11) uniform uint hdMode;
+ layout(location = 12) uniform uint order3d;
++layout(binding = 6) uniform usampler2D texPcScanlines;
++layout(location = 13) uniform uint pcLcd;
+ in vec2 uv;
+ out vec4 outColor;
+ 
+@@ -279,7 +291,7 @@
+ 
+ // Mirrors compose() in gpu2d.cpp exactly, including the 3D layer's forced
+ // per-pixel 5-bit blend whenever the pixel behind it is a second target.
+-uvec3 composeLayers(Layer top, Layer below)
++uvec3 composeLayers(Layer top, Layer below, uint bldcnt, uint eva, uint evb, uint evy)
+ {
+     uint target2 = below.target << 8;
+     if (top.alpha5 != 0u) {
+@@ -311,6 +323,40 @@
+ 
+ void main()
+ {
++    if (pcLcd != 0u) {
++        vec2 pos = vec2(uv.x, 1.0 - uv.y);
++        ivec2 dst = ivec2(pos * vec2(256, 192));
++        uvec4 config = texelFetch(texPcScanlines, ivec2(0, dst.y), 0);
++        if ((config.z & 3u) != pcLcd) {
++            outColor = vec4(texelFetch(texFallback, dst, 0)) / 255.0;
++            return;
++        }
++        uvec2 pixel = texelFetch(texHdTop, dst, 0).xy;
++        Layer top = unpackLayer(pixel);
++        Layer below = unpackLayer(texelFetch(texHdBelow, dst, 0).xy);
++        int scroll = int((config.z >> 8) & 511u);
++        if (scroll >= 256) scroll -= 512;
++        pos.x += float(scroll) / 256.0;
++        if ((pixel.y & 64u) != 0u && pos.x >= 0.0 && pos.x < 1.0) {
++            vec4 hi = texelFetch(tex3dHi, ivec2(pos * vec2(textureSize(tex3dHi, 0))), 0);
++            uint alpha = uint(round(hi.a * 31.0));
++            if (alpha != 0u) {
++                Layer l3 = Layer(uvec3(round(hi.bgr * 63.0)), 1u, top.effects,
++                                 0u, alpha, config.z >> 24, 1u);
++                if (ahead(l3, top)) { below = top; top = l3; }
++                else if (ahead(l3, below)) { below = l3; }
++            }
++        }
++        uvec3 c = composeLayers(top, below, config.x, config.w & 255u,
++                                (config.w >> 8) & 255u, config.w >> 16);
++        uint mode = config.y >> 14;
++        uint factor = min(config.y & 31u, 16u);
++        if (mode == 1u) c = brighten(c, factor, 0u);
++        else if (mode == 2u) c = darken(c, factor, 15u);
++        outColor = vec4(vec3((c << 2) | (c >> 4)) / 255.0, 1.0);
++        return;
++    }
++
+     ivec2 size = textureSize(texFallback, 0);
+     ivec2 dst = ivec2(clamp(uv * vec2(size), vec2(0.0),
+                             vec2(size) - vec2(1.0)));
+@@ -355,7 +401,7 @@
+                 else if (ahead(l3, below)) { below = l3; }
+             }
+         }
+-        uvec3 c = composeLayers(top, below);
++        uvec3 c = composeLayers(top, below, bldcnt, eva, evb, evy);
+         uint bm = masterBright >> 14;
+         uint bf = min(masterBright & 31u, 16u);
+         if (bm == 1u) c = brighten(c, bf, 0u);
+@@ -488,6 +534,14 @@
+ 
+ void stop_presenter()
+ {
++    if (g_pc_scanlines) glDeleteTextures(1, &g_pc_scanlines);
++    if (g_pc_color) glDeleteTextures(1, &g_pc_color);
++    if (g_pc_framebuffer) glDeleteFramebuffers(1, &g_pc_framebuffer);
++    if (g_pc_readback) glDeleteBuffers(1, &g_pc_readback);
++    g_pc_readback = 0;
++    g_pc_readback_bytes = 0;
++    g_pc_scanlines = g_pc_color = g_pc_framebuffer = 0;
++    g_pc_width = g_pc_height = 0;
+     glDeleteTextures(2, g_hd_below_texture);
+     glDeleteTextures(2, g_hd_top_texture);
+     glDeleteTextures(2, g_object_texture);
+@@ -547,7 +601,7 @@
+ }
+ }
+ 
+-bool nds_compute_host_start(SDL_Window* presentation_window)
++bool nds_compute_host_start(SDL_Window* presentation_window, bool pc_raster)
+ {
+     const NdsGpu3dRendererPolicy policy = nds_gpu3d_renderer_policy();
+     if (policy == NdsGpu3dRendererPolicy::Soft) return true;
+@@ -616,8 +670,8 @@
+         std::fprintf(stderr, "[gpu3d] compute renderer init failed\n");
+         return fail_or_fallback("compute renderer initialization");
+     }
+-    if (g_visible && !start_presenter()) {
+-        std::fprintf(stderr, "[gpu3d] direct presenter init failed\n");
++    if ((g_visible || pc_raster) && !start_presenter()) {
++        std::fprintf(stderr, "[gpu3d] OpenGL presenter init failed\n");
+         return fail_or_fallback("direct presenter initialization");
+     }
+     if (g_visible) SDL_GL_SetSwapInterval(0);
+@@ -710,6 +764,7 @@
+     glActiveTexture(GL_TEXTURE2);
+     glBindTexture(GL_TEXTURE_2D, g_fallback_texture[buffer]);
+     glUniform1ui(0, direct_frame ? 1u : 0u);
++    glUniform1ui(13, 0u);
+     glUniform1ui(1, static_cast<GLuint>(width));
+     glUniform1ui(11, hd_active ? 1u : 0u);
+     if (hd_active) {
+@@ -764,6 +819,103 @@
+     return glGetError() == GL_NO_ERROR;
+ }
+ 
++bool nds_compute_host_resolve_pc_raster(int lcd, const NdsGpu2dPcRasterFrame& layers,
++                                       const unsigned int* native_pixels, unsigned int raster,
++                                       int width, int height, void* pixels, int pitch)
++{
++    if (!g_present_program || !nds_compute_host_make_current()) return false;
++    if (!g_pc_framebuffer) {
++        glGenFramebuffers(1, &g_pc_framebuffer);
++        glGenTextures(1, &g_pc_color);
++        glGenTextures(1, &g_pc_scanlines);
++        glActiveTexture(GL_TEXTURE6);
++        glBindTexture(GL_TEXTURE_2D, g_pc_scanlines);
++        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
++        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
++        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA32UI, 1, 192, 0,
++                     GL_RGBA_INTEGER, GL_UNSIGNED_INT, nullptr);
++        configure_integer_texture(g_fallback_texture[0], 256);
++        configure_layer_texture(g_hd_top_texture[0], 256);
++        configure_layer_texture(g_hd_below_texture[0], 256);
++    }
++    glBindFramebuffer(GL_FRAMEBUFFER, g_pc_framebuffer);
++    if (g_pc_width != width || g_pc_height != height) {
++        glBindTexture(GL_TEXTURE_2D, g_pc_color);
++        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, width, height, 0,
++                     GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
++        glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
++                               GL_TEXTURE_2D, g_pc_color, 0);
++        if (glCheckFramebufferStatus(GL_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE) {
++            glBindFramebuffer(GL_FRAMEBUFFER, 0);
++            return false;
++        }
++        g_pc_width = width;
++        g_pc_height = height;
++    }
++
++    glBindBuffer(GL_PIXEL_UNPACK_BUFFER, 0);
++    auto upload = [](GLenum unit, GLuint texture, int columns, GLenum format,
++                     GLenum type, const void* data) {
++        glActiveTexture(unit);
++        glBindTexture(GL_TEXTURE_2D, texture);
++        glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, columns, 192, format, type, data);
++    };
++    upload(GL_TEXTURE2, g_fallback_texture[0], 256, GL_BGRA_INTEGER, GL_UNSIGNED_BYTE, native_pixels);
++    upload(GL_TEXTURE4, g_hd_top_texture[0], 256, GL_RG_INTEGER, GL_UNSIGNED_INT, layers.top);
++    upload(GL_TEXTURE5, g_hd_below_texture[0], 256, GL_RG_INTEGER, GL_UNSIGNED_INT, layers.below);
++    upload(GL_TEXTURE6, g_pc_scanlines, 1, GL_RGBA_INTEGER, GL_UNSIGNED_INT, layers.scanlines);
++    glActiveTexture(GL_TEXTURE3);
++    glBindTexture(GL_TEXTURE_2D, raster);
++    glMemoryBarrier(GL_TEXTURE_FETCH_BARRIER_BIT);
++
++    glViewport(0, 0, width, height);
++    glUseProgram(g_present_program);
++    glUniform1ui(13, static_cast<GLuint>(lcd + 1));
++    glBindVertexArray(g_present_vao);
++    glDrawArrays(GL_TRIANGLES, 0, 3);
++
++    bool copied = true;
++    if (g_wait_pump) {
++        // Stage the transfer first so a due display slot can use its cached
++        // textures while this copy is still on the GPU.
++        if (!g_pc_readback) glGenBuffers(1, &g_pc_readback);
++        glBindBuffer(GL_PIXEL_PACK_BUFFER, g_pc_readback);
++        const size_t row_bytes = static_cast<size_t>(width) * 4;
++        const size_t bytes = row_bytes * height;
++        if (g_pc_readback_bytes < bytes) {
++            glBufferData(GL_PIXEL_PACK_BUFFER, bytes, nullptr, GL_STREAM_READ);
++            g_pc_readback_bytes = glGetError() == GL_NO_ERROR ? bytes : 0;
++        }
++        copied = false;
++        if (g_pc_readback_bytes >= bytes) {
++            glReadPixels(0, 0, width, height, GL_BGRA, GL_UNSIGNED_BYTE, nullptr);
++            GLsync fence = glFenceSync(GL_SYNC_GPU_COMMANDS_COMPLETE, 0);
++            glFlush();
++            if (fence && nds_compute_host_wait_on_fence(fence)) {
++                const auto* data = static_cast<const unsigned char*>(
++                    glMapBufferRange(GL_PIXEL_PACK_BUFFER, 0, bytes, GL_MAP_READ_BIT));
++                if (data) {
++                    auto* dst = static_cast<unsigned char*>(pixels);
++                    for (int y = 0; y < height; ++y)
++                        std::memcpy(dst + y * pitch, data + y * row_bytes, row_bytes);
++                    copied = glUnmapBuffer(GL_PIXEL_PACK_BUFFER) == GL_TRUE;
++                }
++            }
++            if (fence) glDeleteSync(fence);
++        }
++    } else {
++        glBindBuffer(GL_PIXEL_PACK_BUFFER, 0);
++        glPixelStorei(GL_PACK_ROW_LENGTH, pitch / 4);
++        glReadPixels(0, 0, width, height, GL_BGRA, GL_UNSIGNED_BYTE, pixels);
++        glPixelStorei(GL_PACK_ROW_LENGTH, 0);
++    }
++    glBindBuffer(GL_PIXEL_PACK_BUFFER, 0);
++    glBindFramebuffer(GL_FRAMEBUFFER, 0);
++    glActiveTexture(GL_TEXTURE0);
++    const GLenum error = glGetError();
++    return copied && error == GL_NO_ERROR;
++}
++
+ void nds_compute_host_stop()
+ {
+     if (!g_active) {
+@@ -780,6 +932,31 @@
+     return g_active;
+ }
+ 
++void nds_compute_host_set_wait_pump(NdsComputeWaitPump pump, void* context)
++{
++    g_wait_pump = pump;
++    g_wait_context = context;
++}
++
++bool nds_compute_host_wait_on_fence(void* sync)
++{
++    if (!sync) return false;
++    const auto fence = static_cast<GLsync>(sync);
++    GLenum status;
++    if (!g_wait_pump) {
++        status = glClientWaitSync(fence, 0, 5000000000ull);
++    } else {
++        using Clock = std::chrono::steady_clock;
++        const auto deadline = Clock::now() + std::chrono::seconds(5);
++        do {
++            status = glClientWaitSync(fence, 0, 250000ull);
++            if (status != GL_TIMEOUT_EXPIRED) break;
++            g_wait_pump(g_wait_context);
++        } while (Clock::now() < deadline);
++    }
++    return status == GL_ALREADY_SIGNALED || status == GL_CONDITION_SATISFIED;
++}
++
+ NdsGlProc nds_compute_host_gl_proc(const char* name)
+ {
+     if (!g_context || !name || !*name) return nullptr;
+--- a/runner/src/melonds_compute/ComputeHost.h
++++ b/runner/src/melonds_compute/ComputeHost.h
+@@ -4,6 +4,11 @@
+ 
+ struct SDL_Window;
+ struct NdsGpu2dDirectFrame;
++struct NdsGpu2dPcRasterFrame;
++
++bool nds_compute_host_resolve_pc_raster(int lcd, const NdsGpu2dPcRasterFrame& layers,
++                                       const unsigned int* native_pixels, unsigned int raster,
++                                       int width, int height, void* pixels, int pitch);
+ 
+ struct NdsComputePresentTicks {
+     unsigned long long upload = 0;
+@@ -11,7 +16,7 @@
+     unsigned long long swap = 0;
+ };
+ 
+-bool nds_compute_host_start(SDL_Window* presentation_window = nullptr);
++bool nds_compute_host_start(SDL_Window* presentation_window = nullptr, bool pc_raster = false);
+ bool nds_compute_host_make_current();
+ bool nds_compute_host_has_visible_context();
+ bool nds_compute_host_present_top(const unsigned int* fallback_pixels,
+@@ -20,6 +25,9 @@
+                                   NdsComputePresentTicks* ticks);
+ void nds_compute_host_stop();
+ bool nds_compute_host_active();
++using NdsComputeWaitPump = void (*)(void*);
++void nds_compute_host_set_wait_pump(NdsComputeWaitPump pump, void* context);
++bool nds_compute_host_wait_on_fence(void* fence);
+ 
+ // Resolve a GL entry point through the host context. The vendored glad
+ // loader is generated for GL 4.3 core with no extensions, so anything the
+--- a/runner/vendor/melonds/GPU3D_Compute.cpp
++++ b/runner/vendor/melonds/GPU3D_Compute.cpp
+@@ -49,8 +49,12 @@
+     shaderSource += std::to_string(ScreenWidth);
+     shaderSource += "\n#define ScreenHeight ";
+     shaderSource += std::to_string(ScreenHeight);
+-    shaderSource += "\n#define RenderScale ";
+-    shaderSource += std::to_string(ScaleFactor);
++    shaderSource += "\n#define RasterWidth ";
++    shaderSource += std::to_string(RasterWidth);
++    shaderSource += "\n#define RasterHeight ";
++    shaderSource += std::to_string(RasterHeight);
++    shaderSource += "\n#define NativeWidth ";
++    shaderSource += std::to_string(RenderWidth);
+     shaderSource += "\n#define MaxWorkTiles ";
+     shaderSource += std::to_string(MaxWorkTiles);
+ 
+@@ -241,6 +245,7 @@
+     glDeleteBuffers(1, &YSpanIndicesTextureMemory);
+     glDeleteTextures(1, &YSpanIndicesTexture);
+     glDeleteTextures(1, &Framebuffer);
++    glDeleteTextures(1, &AlternateFramebuffer);
+     glDeleteTextures(1, &LowResFramebuffer);
+     glDeleteBuffers(1, &MetaUniformMemory);
+ 
+@@ -293,9 +298,13 @@
+ void ComputeRenderer::Reset(GPU& gpu)
+ {
+     Texcache.Reset();
+-}
+-
+-void ComputeRenderer::SetRenderSettings(int scale, bool highResolutionCoordinates)
++    if (NativeRaster) NativeRaster->Reset(gpu);
++    RenderedNativeRaster = false;
++    RenderedRaster = false;
++    PresentedFramebuffer = 0;
++}
++
++bool ComputeRenderer::SetRenderSettings(int scale, bool highResolutionCoordinates, int height)
+ {
+     CurGLCompositor.SetScaleFactor(scale);
+ 
+@@ -307,8 +316,19 @@
+     ShaderStepIdx = 0;
+ 
+     ScaleFactor = scale;
+-    ScreenWidth = RenderWidth * ScaleFactor;
+-    ScreenHeight = 192 * ScaleFactor;
++    RasterHeight = height ? height : 192 * scale;
++    RasterWidth = (RenderWidth * RasterHeight + 96) / 192;
++    // Binning dispatches whole 64x32 groups. The final pass clips the padding.
++    ScreenWidth = (RasterWidth + CoarseTileW - 1) / CoarseTileW * CoarseTileW;
++    ScreenHeight = (RasterHeight + CoarseTileH - 1) / CoarseTileH * CoarseTileH;
++
++    GLint64 maxBlock = 0;
++    GLint maxTexture = 0;
++    glGetInteger64v(GL_MAX_SHADER_STORAGE_BLOCK_SIZE, &maxBlock);
++    glGetIntegerv(GL_MAX_TEXTURE_SIZE, &maxTexture);
++    const auto tileBytes = 64ll * ScreenWidth * ScreenHeight;
++    if (tileBytes > maxBlock || RasterWidth > maxTexture || RasterHeight > maxTexture)
++        return false;
+ 
+     TilesPerLine = ScreenWidth/TileSize;
+     TileLines = ScreenHeight/TileSize;
+@@ -340,7 +360,14 @@
+         glDeleteTextures(1, &Framebuffer);
+     glGenTextures(1, &Framebuffer);
+     glBindTexture(GL_TEXTURE_2D, Framebuffer);
+-    glTexStorage2D(GL_TEXTURE_2D, 1, GL_RGBA8, ScreenWidth, ScreenHeight);
++    glTexStorage2D(GL_TEXTURE_2D, 1, GL_RGBA8, RasterWidth, RasterHeight);
++    if (AlternateFramebuffer) glDeleteTextures(1, &AlternateFramebuffer);
++    AlternateFramebuffer = PresentedFramebuffer = 0;
++    if (height > 192) {
++        glGenTextures(1, &AlternateFramebuffer);
++        glBindTexture(GL_TEXTURE_2D, AlternateFramebuffer);
++        glTexStorage2D(GL_TEXTURE_2D, 1, GL_RGBA8, RasterWidth, RasterHeight);
++    }
+ 
+     if (LowResFramebuffer != 0)
+         glDeleteTextures(1, &LowResFramebuffer);
+@@ -354,7 +381,7 @@
+ 
+     // eh those are pretty bad guesses
+     // though real hw shouldn't be eable to render all 2048 polygons on every line either
+-    int maxYSpanIndices = 64*2048 * ScaleFactor;
++    int maxYSpanIndices = 64*2048 * ((RasterHeight + 191) / 192);
+     YSpanIndices.resize(maxYSpanIndices);
+ 
+     glBindBuffer(GL_TEXTURE_BUFFER, YSpanIndicesTextureMemory);
+@@ -365,6 +392,7 @@
+ 
+     glBindTexture(GL_TEXTURE_BUFFER, YSpanIndicesTexture);
+     glTexBuffer(GL_TEXTURE_BUFFER, GL_RGBA16UI, YSpanIndicesTextureMemory);
++    return true;
+ }
+ 
+ void ComputeRenderer::SetRenderWidth(u32 width)
+@@ -613,8 +641,20 @@
+ 
+ void ComputeRenderer::RenderFrame(GPU& gpu)
+ {
++    const bool useNative = NativeRaster && PreferNativeRaster;
++    auto& raster = useNative ? *NativeRaster : *this;
++    const bool switched = useNative != RenderedNativeRaster;
++    // The GPU's VRAM dirtiness was consumed by the previously active cache.
++    if (switched) raster.Texcache.Reset();
++    raster.RenderRaster(gpu, !RenderedRaster || switched);
++    RenderedNativeRaster = useNative;
++    RenderedRaster = true;
++}
++
++void ComputeRenderer::RenderRaster(GPU& gpu, bool force)
++{
+     assert(!NeedsShaderCompile());
+-    if (!Texcache.Update(gpu) && gpu.GPU3D.RenderFrameIdentical)
++    if (!Texcache.Update(gpu) && gpu.GPU3D.RenderFrameIdentical && !force)
+     {
+         return;
+     }
+@@ -736,8 +776,8 @@
+         {
+             if (HiresCoordinates)
+             {
+-                scaledPositions[i][0] = (polygon->Vertices[i]->HiresPosition[0] * ScaleFactor) >> 4;
+-                scaledPositions[i][1] = (polygon->Vertices[i]->HiresPosition[1] * ScaleFactor) >> 4;
++                scaledPositions[i][0] = (polygon->Vertices[i]->HiresPosition[0] * RasterWidth) / (RenderWidth * 16);
++                scaledPositions[i][1] = (polygon->Vertices[i]->HiresPosition[1] * RasterHeight) / (192 * 16);
+             }
+             else
+             {
+@@ -1038,7 +1078,7 @@
+                         1.f / variants[i].Width,
+                         1.f / variants[i].Height);
+                 glBindBuffer(GL_DISPATCH_INDIRECT_BUFFER, BinResultMemory);
+-                glDispatchComputeIndirect(offsetof(BinResultHeader, VariantWorkCount) + i*4*4);
++                glDispatchComputeIndirect(offsetof(BinResultHeader, RasterDispatch) + i * sizeof(u32) * 4);
+             }
+         }
+     }
+@@ -1049,6 +1089,8 @@
+     glDispatchCompute(ScreenWidth/TileSize, ScreenHeight/TileSize, 1);
+     glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT);
+ 
++    // A DS frame is presented after VCount 215 has already rendered its successor.
++    if (AlternateFramebuffer) std::swap(Framebuffer, AlternateFramebuffer);
+     glBindImageTexture(0, Framebuffer, 0, GL_FALSE, 0, GL_WRITE_ONLY, GL_RGBA8);
+     glBindImageTexture(1, LowResFramebuffer, 0, GL_FALSE, 0, GL_WRITE_ONLY, GL_RGBA8UI);
+     u32 finalPassShader = 0;
+@@ -1119,6 +1161,7 @@
+ 
+ u32* ComputeRenderer::GetLine(int line)
+ {
++    if (RenderedNativeRaster) return NativeRaster->GetLine(line);
+     int stride = RenderWidth;
+ 
+     if (line == 0)
+@@ -1143,7 +1186,7 @@
+ void ComputeRenderer::PrepareCaptureFrame()
+ {
+     glBindBuffer(GL_PIXEL_PACK_BUFFER, PixelBuffer);
+-    glBindTexture(GL_TEXTURE_2D, LowResFramebuffer);
++    glBindTexture(GL_TEXTURE_2D, GetLowResTexture());
+     glGetTexImage(GL_TEXTURE_2D, 0, GL_RGBA_INTEGER, GL_UNSIGNED_BYTE, nullptr);
+ }
+ 
+--- a/runner/vendor/melonds/GPU3D_Compute.h
++++ b/runner/vendor/melonds/GPU3D_Compute.h
+@@ -43,7 +43,7 @@
+ 
+     void Reset(GPU& gpu) override;
+ 
+-    void SetRenderSettings(int scale, bool highResolutionCoordinates);
++    bool SetRenderSettings(int scale, bool highResolutionCoordinates, int height = 0);
+     void SetRenderWidth(u32 width) override;
+ 
+     void VCount144(GPU& gpu) override;
+@@ -58,7 +58,7 @@
+     void BindOutputTexture(int buffer) override;
+     [[nodiscard]] GLuint GetLowResTexture() const noexcept
+     {
+-        return LowResFramebuffer;
++        return RenderedNativeRaster ? NativeRaster->LowResFramebuffer : LowResFramebuffer;
+     }
+     // ndsrecomp: the internal-resolution (HD) presenter composites directly
+     // from the high-resolution render target instead of reading back the
+@@ -69,6 +69,18 @@
+     {
+         return Framebuffer;
+     }
++    [[nodiscard]] int GetRasterHeight() const noexcept { return RasterHeight; }
++    [[nodiscard]] GLuint GetPresentedTexture() const noexcept { return PresentedFramebuffer; }
++    void LatchPresentedTexture() noexcept {
++        PresentedFramebuffer = HasPcRaster() ? Framebuffer : 0;
++    }
++    void SetNativeRaster(std::unique_ptr<ComputeRenderer> renderer) {
++        NativeRaster = std::move(renderer);
++    }
++    void UseNativeRaster(bool use) noexcept { PreferNativeRaster = use; }
++    bool HasPcRaster() const noexcept {
++        return AlternateFramebuffer && RenderedRaster && !RenderedNativeRaster;
++    }
+     [[nodiscard]] int GetScaleFactor() const noexcept
+     {
+         return ScaleFactor;
+@@ -81,6 +93,11 @@
+     void ShaderCompileStep(int& current, int& count) override;
+ private:
+     ComputeRenderer(GLCompositor&& compositor);
++    void RenderRaster(GPU& gpu, bool force);
++    std::unique_ptr<ComputeRenderer> NativeRaster;
++    bool PreferNativeRaster = false;
++    bool RenderedNativeRaster = false;
++    bool RenderedRaster = false;
+ 
+     GLuint ShaderInterpXSpans[2];
+     GLuint ShaderBinCombined;
+@@ -200,6 +217,7 @@
+     struct BinResultHeader
+     {
+         u32 VariantWorkCount[MaxVariants*4];
++    u32 RasterDispatch[MaxVariants*4];
+         u32 SortedWorkOffset[MaxVariants];
+ 
+         u32 SortWorkWorkCount[4];
+@@ -237,6 +255,9 @@
+     u32 FramebufferCPU[448*192];
+ 
+     int ScreenWidth, ScreenHeight;
++    int RasterWidth = 0, RasterHeight = 0;
++    GLuint AlternateFramebuffer = 0;
++    GLuint PresentedFramebuffer = 0;
+     int RenderWidth = 256;
+     int TilesPerLine, TileLines;
+     int ScaleFactor = -1;
+--- a/runner/vendor/melonds/GPU3D_Compute_shaders.h
++++ b/runner/vendor/melonds/GPU3D_Compute_shaders.h
+@@ -272,6 +272,7 @@
+ layout (std430, binding = 6) buffer BinResultBuffer
+ {
+     uvec4 VariantWorkCount[MaxVariants];
++    uvec4 RasterDispatch[MaxVariants];
+     uint SortedWorkOffset[MaxVariants];
+ 
+     uvec4 SortWorkWorkCount;
+@@ -1023,7 +1024,13 @@
+             // a bit of a cheat putting this here, but this shader won't run that often
+             SortWorkWorkCount = uvec4((VariantWorkCount[0].w + 31) / 32, 1, 1, 0);
+         }
+-        SortedWorkOffset[gl_GlobalInvocationID.x] = atomicAdd(VariantWorkCount[1].w, VariantWorkCount[gl_GlobalInvocationID.x].z);
++        uint variant = gl_GlobalInvocationID.x;
++        uint tiles = VariantWorkCount[variant].z;
++        SortedWorkOffset[variant] = atomicAdd(VariantWorkCount[1].w, tiles);
++        // A 2160p polygon can cover more than 65,535 tiles. Use rows of
++        // work groups so an indirect command stays within each axis limit.
++        uint columns = clamp(tiles, 1u, 1024u);
++        RasterDispatch[variant] = uvec4(columns, (tiles + columns - 1u) / columns, 1u, 0u);
+     }
+ }
+ 
+@@ -1069,7 +1076,9 @@
+ 
+ void main()
+ {
+-    uvec2 workDesc = WorkDescs[WorkDescsSortedStart + SortedWorkOffset[CurVariant] + gl_WorkGroupID.z];
++    uint tile = gl_WorkGroupID.x + gl_WorkGroupID.y * gl_NumWorkGroups.x;
++    if (tile >= VariantWorkCount[CurVariant].z) return;
++    uvec2 workDesc = WorkDescs[WorkDescsSortedStart + SortedWorkOffset[CurVariant] + tile];
+     Polygon polygon = Polygons[bitfieldExtract(workDesc.y, 0, 11)];
+     ivec2 position = ivec2(bitfieldExtract(workDesc.x, 0, 16), bitfieldExtract(workDesc.x, 16, 16)) + ivec2(gl_LocalInvocationID.xy);
+     int tileOffset = int(bitfieldExtract(workDesc.y, 11, 21)) * TileSize * TileSize + TileSize * int(gl_LocalInvocationID.y) + int(gl_LocalInvocationID.x);
+@@ -1529,6 +1538,8 @@
+ void main()
+ {
+     int srcX = int(gl_GlobalInvocationID.x);
++    if (srcX >= RasterWidth || gl_GlobalInvocationID.y >= RasterHeight)
++        return;
+     int resultOffset = int(srcX) + int(gl_GlobalInvocationID.y) * ScreenWidth;
+ 
+     uvec2 color = uvec2(ResultValue[resultOffset+ResultColorStart], ResultValue[resultOffset+FramebufferStride+ResultColorStart]);
+@@ -1546,7 +1557,7 @@
+             otherAttr.x = ResultValue[resultOffset-1+ResultAttrStart];
+             otherDepth.x = ResultValue[resultOffset-1+ResultDepthStart];
+         }
+-        if (srcX < ScreenWidth-1)
++        if (srcX < RasterWidth-1)
+         {
+             otherAttr.y = ResultValue[resultOffset+1+ResultAttrStart];
+             otherDepth.y = ResultValue[resultOffset+1+ResultDepthStart];
+@@ -1556,7 +1567,7 @@
+             otherAttr.z = ResultValue[resultOffset-ScreenWidth+ResultAttrStart];
+             otherDepth.z = ResultValue[resultOffset-ScreenWidth+ResultDepthStart];
+         }
+-        if (gl_GlobalInvocationID.y < ScreenHeight-1)
++        if (gl_GlobalInvocationID.y < RasterHeight-1)
+         {
+             otherAttr.w = ResultValue[resultOffset+ScreenWidth+ResultAttrStart];
+             otherDepth.w = ResultValue[resultOffset+ScreenWidth+ResultDepthStart];
+@@ -1641,11 +1652,12 @@
+     result /= vec4(63.0, 63.0, 63.0, 31.0);
+     imageStore(FinalFB, ivec2(gl_GlobalInvocationID.xy), result);
+ 
+-    // It's a division by constant, so using the builtin division is fine
+-    const int scale = RenderScale;
+-    ivec2 lowresCoordinate = ivec2(gl_GlobalInvocationID.xy) / scale;
+-    ivec2 lowresCoordinateRest = ivec2(gl_GlobalInvocationID.xy) % scale;
+-    if (lowresCoordinateRest == ivec2(0, 0))
++    // Select one raster sample per native pixel, including fractional scales.
++    const ivec2 nativeSize = ivec2(NativeWidth, 192);
++    const ivec2 rasterSize = ivec2(RasterWidth, RasterHeight);
++    ivec2 source = ivec2(gl_GlobalInvocationID.xy);
++    ivec2 lowresCoordinate = ((source + 1) * nativeSize - 1) / rasterSize;
++    if (source == lowresCoordinate * rasterSize / nativeSize)
+     {
+         uvec4 color8;
+         color8.x = bitfieldExtract(color.x, 0, 8);

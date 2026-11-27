@@ -75,12 +75,16 @@ void sonic_pc_load(const std::string& path) {
         bounded("screen_mode",1,g_sonic_pc.screen_mode);
         bounded("window_mode",2,g_sonic_pc.window_mode);
         bounded("resolution",8,g_sonic_pc.resolution);
+    bounded("internal_resolution", static_cast<int>(kSonicRasterHeights.size()) - 1,
+            g_sonic_pc.internal_resolution);
         bounded("filter",2,g_sonic_pc.filter);
         bounded("border",2,g_sonic_pc.border);
         bounded("menu_language",1,g_sonic_pc.menu_language);
         bounded("game_language",1,g_sonic_pc.game_language);
         bounded("aspect_mode",1,g_sonic_pc.aspect_mode);
         bounded("frame_rate",2,g_sonic_pc.frame_rate);
+        bounded("dual_monitors",1,g_sonic_pc.dual_monitors);
+        bounded("dual_monitors_inverted",1,g_sonic_pc.dual_monitors_inverted);
         bounded("trick_button_jumps",1,g_sonic_pc.trick_button_jumps);
         bounded("battle_role",2,g_sonic_pc.battle_role);
         auto address = [&](const char* key) {
@@ -109,12 +113,15 @@ bool sonic_pc_save(const std::string& path) {
             out << "version = 1\nscreen_mode = " << g_sonic_pc.screen_mode
                 << "\nwindow_mode = " << g_sonic_pc.window_mode
                 << "\nresolution = " << g_sonic_pc.resolution
+    << "\ninternal_resolution = " << g_sonic_pc.internal_resolution
                 << "\nfilter = " << g_sonic_pc.filter
                 << "\nborder = " << g_sonic_pc.border
                 << "\nmenu_language = " << g_sonic_pc.menu_language
                 << "\ngame_language = " << g_sonic_pc.game_language
                 << "\naspect_mode = " << g_sonic_pc.aspect_mode
                 << "\nframe_rate = " << g_sonic_pc.frame_rate
+                << "\ndual_monitors = " << g_sonic_pc.dual_monitors
+                << "\ndual_monitors_inverted = " << g_sonic_pc.dual_monitors_inverted
                 << "\ntrick_button_jumps = " << g_sonic_pc.trick_button_jumps
                 << "\nbattle_role = " << g_sonic_pc.battle_role
                 << "\nbattle_local_ip = \"" << g_sonic_pc.battle_local_ip << '"'

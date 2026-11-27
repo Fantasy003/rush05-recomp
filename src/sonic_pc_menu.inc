@@ -7,6 +7,7 @@ struct RuntimeMenuState {
     bool close_requested = false;
     std::function<bool(const SonicPcPreferences&)> apply_display;
     std::function<bool()> supports_high_refresh;
+    std::function<bool(int, int)> apply_internal_resolution;
     std::vector<RecompRuntimeUiItem> items;
     std::string settings_path;
     RecompRuntimeUi* ui = nullptr;
@@ -15,6 +16,7 @@ struct RuntimeMenuState {
     bool capture_menu_control = false;
     bool game_language_changed = false;
     bool frame_rate_changed = false;
+    bool dual_monitors_changed = false;
     bool battle_changed = false;
 };
 RuntimeMenuState* g_sonic_menu = nullptr;
@@ -51,16 +53,19 @@ constexpr const char* kSonicMenuEnglishActions[kSonicMenuActionCount] = {
 constexpr const char* kSonicMenuSpanishActions[kSonicMenuActionCount] = {
     "Arriba", "Abajo", "Izquierda", "Derecha", "Aceptar", "Atras"
 };
-const char* const kSonicViews[] = {"NDS", "Concentrado"};
+const char* const kSonicViews[] = {"NDS", "Focus"};
 const char* kSonicAspectModes[2]{};
 const char* const kSonicFrameRates[] = {"30 FPS", "60 FPS", "120 FPS"};
 const char* kSonicWindows[3]{};
 const char* kSonicResolutions[] = {"Auto", "640 x 480", "800 x 600",
     "1024 x 768", "1280 x 720", "1600 x 900", "1920 x 1080", "2560 x 1440", "3840 x 2160"};
+const char* kSonicInternalResolutions[kSonicRasterHeights.size()] = {
+    nullptr, "240p", "480p", "560p", "720p", "1080p", "1440p", "2160p"
+};
 const char* kSonicFilters[3]{};
 const char* kSonicBorders[3]{};
 const char* const kSonicLanguages[] = {"English", "Espanol"};
-const char* kSonicTrickJumpChoices[2]{};
+const char* kSonicOffOnChoices[2]{};
 const char* kSonicBattleRoles[3]{};
 
 void sonic_pc_window_pixels(int& width,int& height) {
@@ -138,14 +143,15 @@ std::vector<RecompRuntimeUiItem> sonic_build_menu_items() {
     kSonicWindows[0] = sonic_text("Windowed","Ventana");
     kSonicWindows[1] = sonic_text("Fullscreen","Pantalla completa");
     kSonicWindows[2] = sonic_text("Borderless","Sin bordes");
+    kSonicInternalResolutions[0] = sonic_text("Native (192p)", "Nativa (192p)");
     kSonicFilters[0] = sonic_text("Sharp","Nitido");
     kSonicFilters[1] = sonic_text("Soft","Suave");
     kSonicFilters[2] = sonic_text("Smooth edges","Bordes suaves");
     kSonicBorders[0] = sonic_text("Original","Original");
     kSonicBorders[1] = sonic_text("Black","Negro");
     kSonicBorders[2] = sonic_text("Graphite","Grafito");
-    kSonicTrickJumpChoices[0] = sonic_text("Off","No");
-    kSonicTrickJumpChoices[1] = sonic_text("On","Si");
+    kSonicOffOnChoices[0] = sonic_text("Off","No");
+    kSonicOffOnChoices[1] = sonic_text("On","Si");
     kSonicBattleRoles[0] = sonic_text("Offline","Sin red");
     kSonicBattleRoles[1] = sonic_text("Host","Crear sala");
     kSonicBattleRoles[2] = sonic_text("Join","Unirse");
@@ -163,17 +169,27 @@ std::vector<RecompRuntimeUiItem> sonic_build_menu_items() {
     choice("sonic.screen_mode", Display, sonic_text("View","Modo"),
            sonic_text("Both screens or follow the action.","Dos pantallas o seguir la accion."), kSonicViews);
     choice("sonic.window_mode", Display, sonic_text("Window","Ventana"),
-           sonic_text("Select how the window is shown.","Cambia el modo de ventana."), kSonicWindows);
+           sonic_text("Dual-monitor fullscreen uses desktop modes.",
+                      "Con dos monitores, completa es sin bordes."), kSonicWindows);
     choice("sonic.resolution", Display, sonic_text("Resolution","Resolucion"),
            sonic_text("Borderless uses desktop resolution.","Sin bordes usa la del escritorio."), kSonicResolutions);
+    choice("sonic.internal_resolution", Display, sonic_text("Internal resolution","Resolucion interna"),
+           sonic_text("3D rendering. Higher settings need a faster GPU.",
+                      "Render 3D. Los valores altos requieren mas GPU."), kSonicInternalResolutions);
     choice("sonic.filter", Display, sonic_text("Scaling filter","Filtro"),
            sonic_text("Smooth edges softens pixel steps.","Suaviza las diagonales de pixeles."), kSonicFilters);
     choice("sonic.border", Display, sonic_text("Screen frame","Marco"),
            sonic_text("Uniform frame around the DS image.","Marco uniforme para la imagen."), kSonicBorders);
     choice("sonic.aspect_mode", Display, sonic_text("Aspect","Proporcion"),
-           sonic_text("Fit fills the screen in Concentrado.","Concentrado llena en los niveles."), kSonicAspectModes);
+           sonic_text("Fit fills each monitor in dual mode.","Llenar ajusta la imagen a cada monitor."), kSonicAspectModes);
     choice("sonic.frame_rate", Display, sonic_text("Frame rate","FPS"),
            sonic_text("120 FPS blends on 120 Hz displays.","120 FPS mezcla cuadros a 120 Hz."), kSonicFrameRates);
+    choice("sonic.dual_monitors", Display, sonic_text("Dual monitors","Dos monitores"),
+           sonic_text("One DS screen per monitor. Reopen game.","Una LCD por monitor. Volve a abrir."),
+           kSonicOffOnChoices);
+    choice("sonic.dual_monitors_inverted", Display, sonic_text("Invert screens","Invertir pantallas"),
+           sonic_text("Swap monitors when both screens are shown.","Cambia de monitor cada LCD visible."),
+           kSonicOffOnChoices);
     for (unsigned i : kSonicGameplayOrder) {
         std::snprintf(g_sonic_key_ids[i],sizeof(g_sonic_key_ids[i]),"sonic.key.%u",i);
         action(g_sonic_key_ids[i], Keyboard, g_sonic_key_labels[i],
@@ -198,7 +214,7 @@ std::vector<RecompRuntimeUiItem> sonic_build_menu_items() {
            sonic_text("Applies when the game next starts.","Se aplica al volver a abrir el juego."), kSonicLanguages);
     choice("sonic.trick_button_jumps", Gameplay, sonic_text("Jump with Trick","Saltar con Truco"),
            sonic_text("Off uses only Jump to start a jump.","No: solo Saltar inicia el salto."),
-           kSonicTrickJumpChoices);
+           kSonicOffOnChoices);
     choice("sonic.battle_role", BattlePlay, sonic_text("Connection","Conexion"),
            sonic_text("Applies next launch.","Se aplica al reabrir."), kSonicBattleRoles);
     items.push_back({"sonic.battle_local_ip", g_sonic_sections[BattlePlay],
@@ -220,12 +236,15 @@ int* sonic_menu_preference(const char* key) {
     if (std::strcmp(key,"sonic.screen_mode")==0) return &g_sonic_pc.screen_mode;
     if (std::strcmp(key,"sonic.window_mode")==0) return &g_sonic_pc.window_mode;
     if (std::strcmp(key,"sonic.resolution")==0) return &g_sonic_pc.resolution;
+    if (std::strcmp(key,"sonic.internal_resolution")==0) return &g_sonic_pc.internal_resolution;
     if (std::strcmp(key,"sonic.filter")==0) return &g_sonic_pc.filter;
     if (std::strcmp(key,"sonic.border")==0) return &g_sonic_pc.border;
     if (std::strcmp(key,"sonic.menu_language")==0) return &g_sonic_pc.menu_language;
     if (std::strcmp(key,"sonic.game_language")==0) return &g_sonic_pc.game_language;
     if (std::strcmp(key,"sonic.aspect_mode")==0) return &g_sonic_pc.aspect_mode;
     if (std::strcmp(key,"sonic.frame_rate")==0) return &g_sonic_pc.frame_rate;
+    if (std::strcmp(key,"sonic.dual_monitors")==0) return &g_sonic_pc.dual_monitors;
+    if (std::strcmp(key,"sonic.dual_monitors_inverted")==0) return &g_sonic_pc.dual_monitors_inverted;
     if (std::strcmp(key,"sonic.trick_button_jumps")==0) return &g_sonic_pc.trick_button_jumps;
     if (std::strcmp(key,"sonic.battle_role")==0) return &g_sonic_pc.battle_role;
     return nullptr;
@@ -243,8 +262,24 @@ int runtime_menu_set_value(void* context,const RecompRuntimeUiItem* item,int val
     int* preference = sonic_menu_preference(item->key);
     if (!preference) return 0;
     const auto previous = g_sonic_pc;
+    if (preference == &g_sonic_pc.internal_resolution && value != *preference) {
+        if (!state->apply_internal_resolution ||
+            !state->apply_internal_resolution(value, previous.internal_resolution)) {
+            if (state->ui) recomp_runtime_ui_set_status(state->ui,
+                sonic_text("3D mode unavailable. Check OpenGL 4.3 support.",
+                           "Modo 3D no disponible. Revisa OpenGL 4.3."));
+            return 0;
+        }
+        *preference = value;
+        return 1;
+    }
     *preference = value;
-    if (preference == &g_sonic_pc.trick_button_jumps) return 1;
+    if (preference == &g_sonic_pc.trick_button_jumps ||
+        preference == &g_sonic_pc.dual_monitors_inverted) return 1;
+    if (preference == &g_sonic_pc.dual_monitors) {
+        state->dual_monitors_changed = true;
+        return 1;
+    }
     if (preference == &g_sonic_pc.battle_role) {
         state->battle_changed = true;
         return 1;
@@ -367,15 +402,19 @@ int runtime_menu_run_action(void* context,const RecompRuntimeUiItem* item) {
     }
     return 0;
 }
-int runtime_menu_is_enabled(void*,const RecompRuntimeUiItem*) {return 1;}
+int runtime_menu_is_enabled(void*,const RecompRuntimeUiItem* item) {
+    return std::strcmp(item->key, "sonic.dual_monitors_inverted") != 0 ||
+        g_sonic_pc.dual_monitors;
+}
 void runtime_menu_save(void* context) {
     auto* state=static_cast<RuntimeMenuState*>(context);if(!state)return;
-    const bool restart_notice = state->game_language_changed;
+    const bool restart_notice = state->game_language_changed || state->dual_monitors_changed;
     const bool battle_notice = state->battle_changed;
     const bool refresh_notice = state->frame_rate_changed && g_sonic_pc.frame_rate == 2 &&
                                 state->supports_high_refresh && !state->supports_high_refresh();
     state->game_language_changed = false;
     state->frame_rate_changed = false;
+    state->dual_monitors_changed = false;
     state->battle_changed = false;
     const bool saved = sonic_pc_save(state->settings_path);
     if (!state->ui) return;

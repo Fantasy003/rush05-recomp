@@ -19,9 +19,15 @@ struct SonicScreenLayout {
     std::array<SonicScreenRect,2> lcd{{{0, 0, 256, 192}, {0, 192, 256, 192}}};
 };
 
+// Each entry names the DS LCD drawn on that monitor. -1 clears the monitor.
+inline std::array<int, 2> sonic_monitor_lcds(bool inverted, int focus, bool boss_hud = false) {
+    if (focus >= 0) return {focus, boss_hud ? 1 - focus : -1};
+    return inverted ? std::array{1, 0} : std::array{0, 1};
+}
+
 inline SonicScreenLayout sonic_screen_layout(
         int output_width, int output_height, int top_width, int bottom_width,
-        int screen_height, int pad, int focus, bool fit) {
+        int screen_height, int pad, int focus, bool fit, bool force_horizontal = false) {
     SonicScreenLayout layout;
     if (focus == 0 || focus == 1) {
         const int width = focus == 0 ? top_width : bottom_width;
@@ -40,8 +46,9 @@ inline SonicScreenLayout sonic_screen_layout(
     const int wide_height = screen_height + 2 * pad;
     // Compare uniform scales as rationals: use a row only if both LCDs
     // can be larger than they would be in a stack on this output.
-    const bool side_by_side = fit && output_width > 0 && output_height > 0 &&
-        int64_t{output_width} * stacked_height > int64_t{output_height} * wide_width;
+    const bool side_by_side = force_horizontal ||
+        (fit && output_width > 0 && output_height > 0 &&
+         int64_t{output_width} * stacked_height > int64_t{output_height} * wide_width);
     if (side_by_side) {
         layout.width = wide_width;
         layout.height = wide_height;
