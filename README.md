@@ -1,6 +1,6 @@
 # rush05-recomp
 
-An unofficial, experimental static recompilation of the 2005 Nintendo DS game **Sonic Rush** for Windows x64.
+An unofficial, experimental static recompilation of the 2005 Nintendo DS game **Sonic Rush** for Windows x64, with an experimental Linux x64 build tested under Ubuntu WSL.
 
 > [!IMPORTANT]
 > **You need an original Sonic Rush USA Nintendo DS cartridge and an unmodified dump of your own copy.** The supported release has game code **ASCE**, revision **0**, size **64 MiB**, and SHA-1 `bc617530bb9b6e4179f2e54d7816c38676812dde`. Both the build script and the launcher check this hash. Keep your ROM private and only make and use a dump where permitted.
@@ -20,6 +20,14 @@ This repository contains the project source, runtime patches, and build tooling.
 5. SDL3 presents the output and handles Windows input. **Concentrado** follows the active DS display in supported gameplay. **Fit-to-Screen** fills the output in that mode while keeping the dual-screen menu proportional. The 30/60/120 FPS settings control presentation. The 120 option adds blended frames on supported displays while the game's logic runs at DS timing.
 
 This is a work in progress. The Windows build and startup path have been tested. Compatibility across the full campaign, special stages, and multiplayer is unverified. The shipped configuration has networking disabled.
+
+## v28 settings and Linux build
+
+In **PC Settings → Gameplay → Performance Governor**, choose On or Off and restart the game. The governor defaults to On. It can cap display transfer at 1080p and reduce internal 3D rendering to 720p under sustained load. Your selected resolution preset stays saved.
+
+The Linux x64 build passed the performance governor, LCD routing, and PC settings tests under Ubuntu WSL. Linux desktop compatibility is still being tested. A graphical session is required to play. Extract the Linux package, then run `./play.sh "/path/to/Sonic Rush (USA).nds"` from the extracted directory. For an unpackaged build, run `./SonicRush` with the same ROM argument.
+
+The Linux build tooling currently lives in the v28 workspace. It needs CMake, a C/C++ toolchain, Python 3, GNU patch, and a native SDL3 development installation. Set `SDL3_DIR` to the directory containing `SDL3Config.cmake` if CMake cannot find it.
 
 ## Build on Windows
 
