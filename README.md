@@ -1,6 +1,6 @@
 # rush05-recomp
 
-An unofficial, experimental static recompilation of the 2005 Nintendo DS game **Sonic Rush** for Windows x64, with an experimental Linux x64 build tested under Ubuntu WSL.
+An unofficial, experimental static recompilation (hybrid) of the 2005 Nintendo DS game **Sonic Rush** for Windows x64, with an experimental Linux x64 build tested under Ubuntu WSL.
 
 > [!IMPORTANT]
 > **You need an original Sonic Rush USA Nintendo DS cartridge and an unmodified dump of your own copy.** The supported release has game code **ASCE**, revision **0**, size **64 MiB**, and SHA-1 `bc617530bb9b6e4179f2e54d7816c38676812dde`. Both the build script and the launcher check this hash. Keep your ROM private and only make and use a dump where permitted.
@@ -17,7 +17,7 @@ This repository contains the project source, runtime patches, and build tooling.
 2. [ndsrecomp](https://github.com/RetroPortingToolKit/ndsrecomp) uses the separately supplied [rushrecomp](https://github.com/Tekkra-Pi/rushrecomp) analysis configs to locate ARM and Thumb code. It translates that code ahead of time to C, with dispatch tables that map guest program counters to the resulting host functions. The alignment guard rejects invalid ARM entry points that would otherwise round down and loop.
 3. MinGW compiles the generated C and links the banks into the Windows runner. The runner provides the DS memory map, CPU scheduling, graphics, audio, touch input, and save devices. Guest code outside the static banks can use the runtime's instruction interpreter. The original ROM supplies game resources during play.
 4. The runner boots directly with FreeBIOS and generated firmware. A runtime patch exposes the LCD HBlank status bit used by the original game's scanline polling code.
-5. SDL3 presents the output and handles Windows input. **Concentrado** follows the active DS display in supported gameplay. **Fit-to-Screen** fills the output in that mode while keeping the dual-screen menu proportional. The 30/60/120 FPS settings control presentation. The 120 option adds blended frames on supported displays while the game's logic runs at DS timing.
+5. SDL3 presents the output and handles Windows input. **Focus** follows the active DS display in supported gameplay. **Fit-to-Screen** fills the output in that mode while keeping the dual-screen menu proportional. The 30/60/120 FPS settings control presentation. The 120 option adds blended frames on supported displays while the game's logic runs at DS timing.
 
 This is a work in progress. The Windows build and startup path have been tested. Compatibility across the full campaign, special stages, and multiplayer is unverified. The shipped configuration has networking disabled.
 
